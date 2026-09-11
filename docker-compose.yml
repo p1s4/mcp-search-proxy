@@ -1,0 +1,30 @@
+services:
+  mcp-search-proxy:
+    build: .
+    image: mcp-search-proxy:1.0.0
+    container_name: mcp-search-proxy
+    restart: unless-stopped
+    mem_limit: 512m
+    memswap_limit: 512m
+    env_file:
+      - .env
+    environment:
+      # Upstream MCP servers, comma-separated (Streamable HTTP).
+      # First URL wins on tool-name collisions (fail-closed merge).
+      - UPSTREAM_URLS=${UPSTREAM_URLS}
+      # Bearer tokens, positional against UPSTREAM_URLS (empty entry = no auth).
+      # Example with 2 upstreams, second without auth: "sk-abc123,"
+      - UPSTREAM_TOKENS=${UPSTREAM_TOKENS:-}
+      - UPSTREAM_TIMEOUT_A11Y=280
+      - MANIFEST_PATH=/app/data/manifest.json
+      - PORT=8092
+      # Reactive refresh only: no polling, no listChanged handling.
+      # 1800 = safety-net TTL, 0 = explicit mcp_refresh / unknown-tool only.
+      - CATALOG_TTL_SEC=1800
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+
+networks:
+  default:
+    name: proxy-net
