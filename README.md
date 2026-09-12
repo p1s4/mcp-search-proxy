@@ -43,7 +43,7 @@ Same capability, ~60x less context per turn. The cost moves to 1–2 extra tool 
 
 - **< 30 tools**: just connect the server directly, the proxy adds round-trips for nothing.
 - You need **full schemas every turn** (e.g. a planner that scores all tools in one pass) — this proxy hides schemas by design.
-- You need **semantic/vector search**: retrieval here is purely **lexical** (BM25). Mixed-language catalogs (e.g. English queries over half-Italian descriptions) work for specific queries but degenerate single-word queries misrank — e.g. `mail` ranks `mailchimp-*` above `gmail-*` because only 2/532 docs contain the literal token `mail` (both mailchimp). Specific queries (`send gmail email`) rank correctly.
+- You need **semantic/vector search**: retrieval here is purely **lexical** (BM25 + keyword boosts). Mixed-language catalogs (e.g. English queries over half-Italian descriptions) work for specific queries; single-word `mail` now resolves to `gmail-*` via a provider-suffix boost (`mail` is a suffix of `gmail`, not a prefix of `mailchimp`). Specific queries (`send gmail email`) rank correctly.
 - You need **push updates**: there is no `listChanged` handling, no SSE subscription, no polling. Refresh is fetch-once + explicit `mcp_refresh` + one-shot re-list on unknown-tool + long TTL. Right for toolsets that change a few times a month; wrong for registries that churn every minute.
 - You need **media rendering**: `mcp_call` returns the raw upstream result (`content`/`structuredContent`), no image/audio post-processing.
 - Stateful servers behind a **non-sticky** aggregator stay broken: this proxy fixes that only when clients go **through the proxy** (it keeps sticky sessions itself).
@@ -136,7 +136,7 @@ Setup: Docker on ARM64, Python 3.12, FastMCP 4.0.3, 2 upstreams (MCP aggregator 
 'github issue' / 'notebooklm query' / 'wger workout today' -> correct first hit
 'navigate browser page screenshot' -> browser_* tools top-5 (cross-upstream search works)
 'xyzzy plugh qqq'                -> [] + available_sources + hint (never a fake miss)
-'mail'                           -> mailchimp-* first (known degenerate-query limit, see above)
+'mail'                           -> 5x gmail-* (provider-suffix boost; two-word queries unchanged)
 ```
 
 **Stateful E2E** (the reason for per-upstream sticky sessions): `browser_navigate https://www.ilbisonte.com/` → lands on `/en` → `scan_page {wcag2a,wcag2aa,wcag21aa,wcag22aa}` on the **same** page → `Violations: 0, Incomplete: 2, Passes: 28` → `browser_snapshot` returns the **same** URL/title, no `No open pages`. Navigate → scan → snapshot share one session through the proxy.
@@ -145,7 +145,7 @@ Setup: Docker on ARM64, Python 3.12, FastMCP 4.0.3, 2 upstreams (MCP aggregator 
 
 ## Limitations (honest)
 
-- Lexical only: synonyms across languages (`mail`/`email`/`posta`) have no alias table; degenerate one-word queries can misrank. Specific multi-word queries are fine.
+- Lexical only: synonyms across languages (`mail`/`email`/`posta`) have no alias table. Single-word `mail` resolves to `gmail-*` via provider-suffix boost; other ambiguous one-word queries can still misrank. Specific multi-word queries are fine.
 - Manual stemmer, English only, zero dependencies by choice. Known over-stemming (`created`→`creat` vs `create`) is rare in real queries and mitigated by gate + limit. Swap in Snowball/nltk if you need full recall.
 - `instructions` tier-1 listing updates server-side on refresh, but already-connected clients keep the old text until their next handshake.
 - `CATALOG_TTL_SEC` re-fetches fan out to every upstream (each aggregator `tools/list` fans out again downstream). Keep it long (default 30 min) or `0`.

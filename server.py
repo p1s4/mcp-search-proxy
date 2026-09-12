@@ -444,8 +444,11 @@ def _search_one(query: str, limit: int) -> list[str]:
     qset = set(qtoks)
     ranked: list[tuple[float, str]] = []
     with _LOCK:
-        snapshot = [(n, _DOC_TOKENS.get(n, [])) for n in names]
-    for n, doc in snapshot:
+        snapshot = [
+            (n, _DOC_TOKENS.get(n, []), ((_BY_NAME.get(n) or {}).get("description") or ""))
+            for n in names
+        ]
+    for n, doc, desc in snapshot:
         # NAME_BONUS bypass sul gate: il gate è scelto sull'intera query e
         # le description sono in parte in IT mentre le query sono in EN.
         # Se il token a IDF più alta (es. 'inbox') manca nel doc, il tool
@@ -473,8 +476,48 @@ def _search_one(query: str, limit: int) -> list[str]:
                     bonus += _idf(t)
                     break
         bonus *= NAME_BONUS_WEIGHT
+        # Keyword boost (reimplementazione originale, stdlib only, pesi da
+        # specifica handoff: +50/+20/+3/+1 sopra BM25+NAME_BONUS).
+        # Idea: il match esplicito su nome/descrizione deve pesare contro
+        # body rumorosi (descrizioni lunghe con TF alto su token rari).
+        # Solo boost additivo: nessun gate min_score (da noi top-N, il gate
+        # lo fa il modello). Ammissione e ordinamento invariati.
+        n_lower = n.lower()
+        d_lower = desc.lower() if isinstance(desc, str) else ""
+        keyword_boost = 0.0
+        if qnorm:
+            if qnorm in n_lower:
+                keyword_boost += 50.0
+            if qnorm in d_lower:
+                keyword_boost += 20.0
+            for term in qset:
+                if not term:
+                    continue
+                if term in n_lower:
+                    keyword_boost += 3.0
+                if term in d_lower:
+                    keyword_boost += 1.0
+            # Adattamento al catalogo namespaced provider-operazione
+            # (originale, solo query a singolo token): il boost letterale
+            # +50/+20 pareggia tutti i contender (es. 'mail' in gmail-* e
+            # mailchimp-*, 'search' in WebSearchAndCrawl-* e github-search-*).
+            # L'operazione esatta (suffix dopo -/_) e il provider (prefix
+            # prima di -/_) disambiguano: 'mail' e' suffisso di 'gmail'
+            # (non prefisso di 'mailchimp'), 'search' e' l'operazione esatta
+            # di WebSearchAndCrawl-search (non di search_analytics).
+            qparts = re.findall(r"[a-z0-9_]+", qnorm)
+            if len(qparts) == 1:
+                q1 = qparts[0]
+                op_lower = n.rsplit("-", 1)[-1].lower() if "-" in n else n.rsplit("_", 1)[-1].lower()
+                src_lower = _source_of(n).lower()
+                if q1 == op_lower:
+                    keyword_boost += 30.0
+                if q1 == src_lower:
+                    keyword_boost += 15.0
+                elif len(q1) >= 4 and src_lower.endswith(q1) and q1 != src_lower:
+                    keyword_boost += 12.0
         if s > 0 or bonus > 0:
-            ranked.append((s + bonus, n))
+            ranked.append((s + bonus + keyword_boost, n))
     ranked.sort(key=lambda x: (-x[0], x[1]))
     return [n for _, n in ranked[:limit]]
 
