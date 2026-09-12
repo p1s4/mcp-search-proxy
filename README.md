@@ -48,6 +48,17 @@ Same capability, ~60x less context per turn. The cost moves to 1–2 extra tool 
 - You need **media rendering**: `mcp_call` returns the raw upstream result (`content`/`structuredContent`), no image/audio post-processing.
 - Stateful servers behind a **non-sticky** aggregator stay broken: this proxy fixes that only when clients go **through the proxy** (it keeps sticky sessions itself).
 
+## Security: token layer, not a security boundary
+
+This proxy reduces what the model **sees**, not what it **can call**. `mcp_call` executes any tool in the catalog by exact name — a hallucinated plausible name or a prompt injection naming one still gets through. Retrieval here is purely a cost optimisation.
+
+Security decisions belong **upstream**, before the proxy:
+
+- Expose MCP servers through an aggregator with per-tool allowlists (e.g. LiteLLM), not directly to the client.
+- Opt in explicitly: new tools added by an upstream server should not enter the served set automatically — someone reviews and enables them (a read vs write/destructive split helps).
+- Anything not enabled is never exposed and not callable, even by exact name.
+- If you plug MCP servers straight into the client with no allowlist thinking, everything gets exposed — the proxy won't save you.
+
 ## How it works
 
 1. **Startup**: `tools/list` fan-out over all `UPSTREAM_URLS` → merge → in-memory BM25 index + on-disk manifest (`MANIFEST_PATH`, survives restarts). Collision policy is fail-closed: first upstream wins, duplicates logged and dropped.
