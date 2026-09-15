@@ -20,6 +20,7 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
 
@@ -27,21 +28,90 @@ from fastmcp import FastMCP
 
 # ---------------------------------------------------------------- config
 
+
+VERSION = "1.0.1"
+USER_AGENT = f"mcp-search-proxy/{VERSION}"
+
+
+def _log(msg: str) -> None:
+    print(f"[mcp-search-proxy] {msg}", flush=True)
+
+
 # Multi-upstream generico (GitHub-ready): lista N server via env.
-# UPSTREAM_URLS comma-separated (nuovo). UPSTREAM_URL singolo (legacy, fallback).
-# Es. prod: "http://litellm:4000/mcp,http://mcp-a11y-proxy:8101/mcp"
-_raw_urls = os.environ.get("UPSTREAM_URLS", "") or os.environ.get("UPSTREAM_URL", "http://litellm:4000/mcp")
-UPSTREAM_URLS: list[str] = [u.strip() for u in _raw_urls.split(",") if u.strip()]
-# dedupe preservando ordine
-_seen: set[str] = set()
-UPSTREAM_URLS = [u for u in UPSTREAM_URLS if not (u in _seen or _seen.add(u))]
-UPSTREAM_URL = UPSTREAM_URLS[0]  # alias legacy (log, single-upstream compat)
+# Formato consigliato: UPSTREAMS=url|token,url|token (token opzionale dopo |).
+# Formato legacy: UPSTREAM_URLS comma-separated + UPSTREAM_TOKENS posizionale.
+# Se UPSTREAMS e settata, IGNORA UPSTREAM_URLS/UPSTREAM_TOKENS/UPSTREAM_URL.
+# Token non contiene "|" ne "," (split entry su ",", coppia sul PRIMO "|").
+# Es. prod legacy: "http://litellm:4000/mcp,http://mcp-a11y-proxy:8101/mcp"
 MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
-# Auth per-upstream (GitHub-ready): UPSTREAM_TOKENS comma-separated, posizionale
-# rispetto a UPSTREAM_URLS (voce vuota = no-auth). Se assente: MASTER_KEY solo
-# sugli URL che contengono "litellm", niente altrove (a11y no-auth).
-_raw_toks = os.environ.get("UPSTREAM_TOKENS", "")
-_UPSTREAM_TOKENS: list[str] = [t.strip() for t in _raw_toks.split(",")] if _raw_toks else []
+_raw_upstreams = os.environ.get("UPSTREAMS", "").strip()
+if _raw_upstreams:
+    _cfg_urls: list[str] = []
+    _cfg_toks: list[str] = []
+    for _entry in _raw_upstreams.split(","):
+        _entry = _entry.strip()
+        if not _entry:
+            continue
+        if "|" in _entry:
+            _u, _t = _entry.split("|", 1)
+            _u, _t = _u.strip(), _t.strip()
+        else:
+            _u, _t = _entry, ""
+        if not _u:
+            continue
+        if _u in _cfg_urls:
+            continue  # dedupe preservando ordine (tengo prima occorrenza)
+        _cfg_urls.append(_u)
+        _cfg_toks.append(_t)
+    UPSTREAM_URLS: list[str] = _cfg_urls
+    _UPSTREAM_TOKENS: list[str] = _cfg_toks
+else:
+    _raw_urls = os.environ.get("UPSTREAM_URLS", "") or os.environ.get("UPSTREAM_URL", "http://litellm:4000/mcp")
+    UPSTREAM_URLS = [u.strip() for u in _raw_urls.split(",") if u.strip()]
+    # dedupe preservando ordine
+    _seen: set[str] = set()
+    UPSTREAM_URLS = [u for u in UPSTREAM_URLS if not (u in _seen or _seen.add(u))]
+    # Auth per-upstream legacy: UPSTREAM_TOKENS comma-separated, posizionale
+    # rispetto a UPSTREAM_URLS (voce vuota = no-auth). Se assente: MASTER_KEY solo
+    # sugli URL che contengono "litellm", niente altrove (a11y no-auth).
+    _raw_toks = os.environ.get("UPSTREAM_TOKENS", "")
+    _UPSTREAM_TOKENS = [t.strip() for t in _raw_toks.split(",")] if _raw_toks else []
+UPSTREAM_URL = UPSTREAM_URLS[0] if UPSTREAM_URLS else ""  # alias legacy (log, single-upstream compat, riallineato dopo validazione)
+
+
+def _scheme_ok(url: str) -> bool:
+    try:
+        return urllib.parse.urlparse(url).scheme in ("http", "https")
+    except Exception:
+        return False
+
+
+def _validate_upstreams() -> None:
+    """Validazione startup: 1 riga per upstream, mai token in chiaro.
+    Scheme non http/https -> WARNING + skip senza crashare (es. typo htps)."""
+    global UPSTREAM_URLS, _UPSTREAM_TOKENS, UPSTREAM_URL
+    valid_urls: list[str] = []
+    valid_toks: list[str] = []
+    n = len(UPSTREAM_URLS)
+    for i, url in enumerate(UPSTREAM_URLS, 1):
+        tok = _UPSTREAM_TOKENS[i - 1] if (i - 1) < len(_UPSTREAM_TOKENS) else ""
+        # il fallback legacy MASTER_KEY (solo URL litellm) conta come auth, come in _token_for
+        has_auth = bool(tok) or bool(MASTER_KEY and "litellm" in url)
+        ok = _scheme_ok(url)
+        _log(f"[{i}/{n}] url={url} scheme_ok={str(ok).lower()} auth={'yes' if has_auth else 'no'}")
+        if not ok:
+            _log(f"WARNING: salto upstream {url}: scheme non http/https, controlla typo (es. htps)")
+            continue
+        valid_urls.append(url)
+        valid_toks.append(tok)
+    UPSTREAM_URLS = valid_urls
+    _UPSTREAM_TOKENS = valid_toks
+    UPSTREAM_URL = UPSTREAM_URLS[0] if UPSTREAM_URLS else ""
+    if not UPSTREAM_URLS:
+        _log("WARNING: nessun upstream valido configurato, il catalogo restera vuoto fino a fix env + restart")
+
+
+_validate_upstreams()
 MANIFEST_PATH = os.environ.get("MANIFEST_PATH", "/app/data/manifest.json")
 PORT = int(os.environ.get("PORT", "8092"))
 TTL_SEC = int(os.environ.get("CATALOG_TTL_SEC", "1800"))  # 0 = off, solo refresh esplicito/unknown-tool
@@ -78,11 +148,8 @@ _N = 0
 _FINGERPRINT = ""
 _LAST_REFRESH = 0.0
 _SESSIONS: dict[str, str] = {}       # sticky per-upstream: url -> sid (mai mixare)
+_STATELESS: set[str] = set()          # upstream senza sid (initialize 200 senza Mcp-Session-Id): session=None
 _TOOL_UPSTREAM: dict[str, str] = {}  # routing: tool-name -> upstream url
-
-
-def _log(msg: str) -> None:
-    print(f"[mcp-search-proxy] {msg}", flush=True)
 
 
 def _fingerprint(tools: list[dict]) -> str:
@@ -98,7 +165,8 @@ def _estimate_tokens(chars: int) -> int:
 # ---------------------------------------------------------------- upstream JSON-RPC (Streamable HTTP, SSE)
 
 def _token_for(url: str) -> str:
-    """Auth per-upstream (posizionale via UPSTREAM_TOKENS, fallback legacy).
+    """Auth per-upstream (posizionale, fallback legacy).
+    Con UPSTREAMS=url|token: token accoppiato alla entry. Con formato legacy:
     UPSTREAM_TOKENS comma-separated, stessa posizione di UPSTREAM_URLS
     (voce vuota = no-auth). Se assente: MASTER_KEY solo su URL litellm."""
     try:
@@ -116,6 +184,9 @@ def _headers(url: str, session: str | None = None) -> dict:
     h = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
+        # UA esplicito: urllib default "Python-urllib/3.12" e bannato da alcuni
+        # site owner via Cloudflare (error 1010 browser_signature_banned, es. getbooyah).
+        "User-Agent": USER_AGENT,
     }
     tok = _token_for(url)
     if tok:
@@ -125,7 +196,9 @@ def _headers(url: str, session: str | None = None) -> dict:
     return h
 
 
-def _parse_sse(body: str) -> list[dict]:
+def _parse_body(body: str) -> list[dict]:
+    """Parse risposta Streamable HTTP: SSE (data: {...}) oppure JSON diretto
+    (alcuni server stateless, es. getbooyah, rispondono application/json puro)."""
     out: list[dict] = []
     for line in body.split("\n"):
         line = line.strip()
@@ -138,7 +211,19 @@ def _parse_sse(body: str) -> list[dict]:
             out.append(json.loads(d))
         except json.JSONDecodeError:
             continue
-    return out
+    if out:
+        return out
+    body = body.strip()
+    if body.startswith("{"):
+        try:
+            return [json.loads(body)]
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+def _parse_sse(body: str) -> list[dict]:
+    return _parse_body(body)
 
 
 def _timeout_for(url: str, default: int) -> int:
@@ -157,9 +242,9 @@ def _post(url: str, payload: dict, session: str | None, timeout: int) -> tuple[s
     req = urllib.request.Request(url, data=data, headers=_headers(url, session), method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            sid = r.headers.get("Mcp-Session-Id") or session
+            sid = r.headers.get("Mcp-Session-Id") or r.headers.get("mcp-session-id") or session
             body = r.read().decode("utf-8", "replace")
-            return sid, _parse_sse(body), r.status
+            return sid, _parse_body(body), r.status
     except urllib.error.HTTPError as e:
         try:
             body = e.read().decode("utf-8", "replace")
@@ -169,13 +254,17 @@ def _post(url: str, payload: dict, session: str | None, timeout: int) -> tuple[s
         raise RuntimeError(f"upstream {url} HTTP {e.code}: {body[:500]}") from e
 
 
-def _ensure_session(url: str) -> str:
+def _ensure_session(url: str) -> str | None:
     """Sticky per-upstream: riuso stretto della sid, mai una nuova per call.
     Per upstream stateful (es. a11y: tab/pagine legati alla sid) questo e il
     punto che evita il tab-perso visto con LiteLLM il 23 Lug (nuova sessione
     per ogni call -> pagina navigata non piu disponibile). Reset solo su
-    400/404/session-expired, una volta, poi retry."""
+    400/404/session-expired, una volta, poi retry.
+    Upstream stateless (initialize 200 senza Mcp-Session-Id, es. gutenberg):
+    nessuna sid, session=None da qui in poi (header Mcp-Session-Id omesso)."""
     with _LOCK:
+        if url in _STATELESS:
+            return None
         sid = _SESSIONS.get(url)
         if sid:
             return sid
@@ -183,23 +272,40 @@ def _ensure_session(url: str) -> str:
         url,
         {"jsonrpc": "2.0", "id": "init-1", "method": "initialize",
          "params": {"protocolVersion": PROTOCOL, "capabilities": {},
-                    "clientInfo": {"name": "mcp-search-proxy", "version": "1.0.0"}}},
+                    "clientInfo": {"name": "mcp-search-proxy", "version": VERSION}}},
         session=None, timeout=20,
     )
     if not sid:
-        raise RuntimeError(f"upstream {url} initialize: session id mancante")
+        with _LOCK:
+            _STATELESS.add(url)
+        _log(f"upstream {url} stateless (initialize senza session id), proseguo senza sid")
+        # notifications/initialized best-effort anche senza sid (alcuni server lo vogliono)
+        try:
+            _post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session=None, timeout=10)
+        except Exception as e:
+            _log(f"initialized notification {url}: {e} (proseguo)")
+        return None
     # notifications/initialized (best-effort, 202 atteso)
     try:
         _post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session=sid, timeout=10)
     except Exception as e:
         _log(f"initialized notification {url}: {e} (proseguo)")
     with _LOCK:
+        _STATELESS.discard(url)
         _SESSIONS[url] = sid
         return sid
 
 
+def _is_stateful(url: str) -> bool:
+    with _LOCK:
+        return url not in _STATELESS
+
+
 def _reset_session(url: str) -> None:
     with _LOCK:
+        # stateless: nessun reset/retry sessione, resta in _STATELESS
+        if url in _STATELESS:
+            return
         _SESSIONS.pop(url, None)
 
 
@@ -227,8 +333,9 @@ def _tools_list_one(url: str) -> tuple[str, list[dict]]:
             err = next((m.get("error") for m in msgs if m.get("error")), None)
             raise RuntimeError(f"tools/list senza result.tools: {json.dumps(msgs)[:800]} err={err}")
         except RuntimeError as e:
-            # sessione scaduta/invalidata -> reset una volta e retry
-            if attempt == 1 and ("400" in str(e) or "404" in str(e) or "session" in str(e).lower()):
+            # sessione scaduta/invalidata -> reset una volta e retry (solo stateful;
+            # per stateless un 400 e errore normale, niente reset/retry sessione)
+            if attempt == 1 and _is_stateful(url) and ("400" in str(e) or "404" in str(e) or "session" in str(e).lower()):
                 _log(f"tools/list {url} retry dopo reset sessione ({e})")
                 _reset_session(url)
                 sid = _ensure_session(url)
@@ -277,7 +384,7 @@ def _tools_call_live(name: str, arguments: dict, timeout: int = 180) -> dict:
                 raise RuntimeError(f"tools/call senza result/error: {json.dumps(msgs)[:800]}")
             except RuntimeError as e:
                 last_err = e
-                if attempt == 1 and ("400" in str(e) or "404" in str(e) or "session" in str(e).lower()):
+                if attempt == 1 and _is_stateful(url) and ("400" in str(e) or "404" in str(e) or "session" in str(e).lower()):
                     _log(f"tools/call {url} retry dopo reset sessione ({e})")
                     _reset_session(url)
                     sid = _ensure_session(url)
@@ -566,7 +673,7 @@ def _load_manifest() -> bool:
         _build_index(tools, payload.get("routing") or None)
         with _LOCK:
             # manifest legacy senza routing (single-upstream 1.0.0): tutto al primo upstream
-            if not _TOOL_UPSTREAM and _TOOLS:
+            if not _TOOL_UPSTREAM and _TOOLS and UPSTREAM_URLS:
                 _TOOL_UPSTREAM.update({t.get("name", ""): UPSTREAM_URLS[0] for t in _TOOLS if t.get("name")})
         global _LAST_REFRESH
         with _LOCK:

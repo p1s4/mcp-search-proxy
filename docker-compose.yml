@@ -1,18 +1,24 @@
 services:
   mcp-search-proxy:
     build: .
-    image: mcp-search-proxy:1.0.0
+    image: mcp-search-proxy:1.0.1
     container_name: mcp-search-proxy
     restart: unless-stopped
     mem_limit: 512m
     memswap_limit: 512m
+    ports:
+      - "8092:8092"
     env_file:
       - .env
     environment:
-      # Upstream MCP servers, comma-separated (Streamable HTTP).
+      # Recommended: coupled url|token pairs (token optional after |).
+      # Example: "https://opendata.cat/api/mcp,https://foo.bar/mcp|sk-abc123"
+      # If UPSTREAMS is set, UPSTREAM_URLS/UPSTREAM_TOKENS are ignored.
+      - UPSTREAMS=${UPSTREAMS:-}
+      # Legacy: upstream MCP servers, comma-separated (Streamable HTTP).
       # First URL wins on tool-name collisions (fail-closed merge).
       - UPSTREAM_URLS=${UPSTREAM_URLS}
-      # Bearer tokens, positional against UPSTREAM_URLS (empty entry = no auth).
+      # Legacy bearer tokens, positional against UPSTREAM_URLS (empty entry = no auth).
       # Example with 2 upstreams, second without auth: "sk-abc123,"
       - UPSTREAM_TOKENS=${UPSTREAM_TOKENS:-}
       - UPSTREAM_TIMEOUT_A11Y=280

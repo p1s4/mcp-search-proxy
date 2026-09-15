@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-Streamable_HTTP-blue)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-1.0.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-1.0.1-blue)](#)
 [![Author](https://img.shields.io/badge/author-p1s4-lightgrey)](#)
 
 Search-first MCP proxy for tool-heavy MCP aggregators. Exposes **4 fixed tools** (~2–3k tokens) instead of forwarding hundreds of full input schemas (~180k tokens) into every model turn.
@@ -70,6 +70,7 @@ Security decisions belong **upstream**, before the proxy:
 Multi-upstream specifics:
 
 - **Sticky sessions**: one `Mcp-Session-Id` per upstream URL, reused strictly. Reset only on 400/404/session-expired, once, then retry. This is what keeps stateful servers (tabs/pages bound to a session id) usable — a non-sticky aggregator in front of them loses the tab between calls.
+- **Stateless upstreams**: if `initialize` returns 200 without a `Mcp-Session-Id` header, the upstream is marked stateless and served with `session=None` (no `Mcp-Session-Id` header on list/call). No session reset/retry on 400 for these — a 400 is a normal error. Stateful behaviour is unchanged where the server returns a session id.
 - **Per-upstream auth**: `UPSTREAM_TOKENS` is positional against `UPSTREAM_URLS` (empty entry = no auth). Fallback: `LITELLM_MASTER_KEY` applies only to URLs containing `litellm`, nothing elsewhere.
 - **Per-upstream timeout**: `UPSTREAM_TIMEOUT_A11Y` (default 280s) applies to URLs containing `a11y`; everything else uses the call default. Raise it for browser/crawl servers behind slow reverse proxies.
 - **Fail-soft fetch, fail-closed merge**: one upstream down → skipped with a log line, the rest still serve. All down → `mcp_refresh` returns an error and the cached catalog stays.
@@ -95,23 +96,49 @@ http://<host>:8092/mcp
 
 No auth client → proxy (internal network). Upstream Bearer tokens stay inside the proxy process.
 
-Minimal `.env`:
+## OpenWebUI in Docker — which URL to use
+
+| where OpenWebUI runs | URL to register |
+|---|---|
+| Same Docker network as the proxy | `http://mcp-search-proxy:8092/mcp` (or `http://<service-name>:8092/mcp`) |
+| On the host / another host | `http://<HOST-IP-OR-NAME>:8092/mcp` |
+
+- NEVER `http://0.0.0.0:...` — that's the listen address, not a routable target.
+- NEVER `http://127.0.0.1:...` from inside another container — it points at the container itself.
+- Watch for `http://` with a double slash (a single-slash `http:/...` is a typo and fails).
+- Check ports: `docker ps` must show `0.0.0.0:8092->8092` (compose publishes `8092:8092`).
+
+Minimal `.env` (recommended format, 1 no-auth upstream):
 
 ```dotenv
-UPSTREAM_URLS=http://upstream1:4000/mcp,http://upstream2:8101/mcp
-UPSTREAM_TOKENS=sk-your-token-here,
-LITELLM_MASTER_KEY=
+UPSTREAMS=http://upstream1:4000/mcp
 CATALOG_TTL_SEC=1800
 ```
 
-`UPSTREAM_TOKENS` has one comma-separated entry per URL in `UPSTREAM_URLS`; leave an entry empty for no-auth upstreams (note the trailing comma above: token for URL #1, none for URL #2). If `UPSTREAM_TOKENS` is unset, `LITELLM_MASTER_KEY` is sent only to URLs containing `litellm`.
+Two formats, same behaviour — pick one:
+
+```dotenv
+# Recommended: coupled url|token pairs (token optional after |).
+# Tokens must not contain | or , (entries split on comma, pair on FIRST |).
+# If UPSTREAMS is set, UPSTREAM_URLS/UPSTREAM_TOKENS below are IGNORED.
+UPSTREAMS=https://opendata.cat/api/mcp,https://foo.bar/mcp|sk-abc123
+
+# Legacy: positional tokens (empty entry = no auth; note the trailing comma:
+# token for URL #1, none for URL #2). Ignored when UPSTREAMS is set.
+# UPSTREAM_URLS=http://upstream1:4000/mcp,http://upstream2:8101/mcp
+# UPSTREAM_TOKENS=sk-your-token-here,
+# LITELLM_MASTER_KEY=
+```
+
+If `UPSTREAM_TOKENS` is unset, `LITELLM_MASTER_KEY` is sent only to URLs containing `litellm`. Tokens are never logged — startup logs only `auth=yes|no` per upstream.
 
 ## Configuration
 
 | var | default | meaning |
 |---|---|---|
-| `UPSTREAM_URLS` | `http://litellm:4000/mcp` | comma-separated upstream MCP URLs (Streamable HTTP). First wins on name collisions. |
-| `UPSTREAM_TOKENS` | (unset) | comma-separated, positional Bearer tokens matching `UPSTREAM_URLS`. Empty = no auth for that slot. |
+| `UPSTREAMS` | (unset) | recommended: coupled `url|token` pairs, comma-separated. Token after `|` optional (absent = no auth). If set, `UPSTREAM_URLS`/`UPSTREAM_TOKENS` are ignored. |
+| `UPSTREAM_URLS` | `http://litellm:4000/mcp` | legacy: comma-separated upstream MCP URLs (Streamable HTTP). First wins on name collisions. |
+| `UPSTREAM_TOKENS` | (unset) | legacy: comma-separated, positional Bearer tokens matching `UPSTREAM_URLS`. Empty = no auth for that slot. |
 | `LITELLM_MASTER_KEY` | (unset) | legacy single-token fallback, sent only to URLs containing `litellm`. |
 | `UPSTREAM_TIMEOUT_A11Y` | `280` | timeout (s) for URLs containing `a11y`. |
 | `CATALOG_TTL_SEC` | `1800` | safety-net TTL for background refresh. `0` = explicit/unknown-tool only. |
