@@ -166,7 +166,7 @@ Setup: Docker on ARM64, Python 3.12, FastMCP 4.0.3, 2 upstreams (MCP aggregator 
 'mail'                           -> 5x gmail-* (provider-suffix boost; two-word queries unchanged)
 ```
 
-**Stateful E2E** (the reason for per-upstream sticky sessions): `browser_navigate https://www.ilbisonte.com/` → lands on `/en` → `scan_page {wcag2a,wcag2aa,wcag21aa,wcag22aa}` on the **same** page → `Violations: 0, Incomplete: 2, Passes: 28` → `browser_snapshot` returns the **same** URL/title, no `No open pages`. Navigate → scan → snapshot share one session through the proxy.
+**Stateful E2E** (the reason for per-upstream sticky sessions): `browser_navigate https://example.com/` → `scan_page {wcag2a,wcag2aa,wcag21aa,wcag22aa}` on the **same** page → `Violations: 0, Incomplete: 2, Passes: 28` → `browser_snapshot` returns the **same** URL/title, no `No open pages`. Navigate → scan → snapshot share one session through the proxy.
 
 **Refresh**: `mcp_refresh` returns same fingerprint when upstreams are unchanged; `mcp_describe` cross-upstream returns `not_found=[]`; unknown-tool triggers one re-list + retry.
 
