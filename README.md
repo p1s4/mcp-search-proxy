@@ -185,6 +185,10 @@ Retrieval pattern inspired by NousResearch's Hermes agent `tool_search` (MIT). N
 
 Published as-is, no assistance. I run this for my own stack and don't have time for setup help — issues and PRs are welcome but answers are not guaranteed.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
