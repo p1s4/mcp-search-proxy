@@ -1,7 +1,7 @@
 services:
   mcp-search-proxy:
     build: .
-    image: mcp-search-proxy:1.0.1
+    image: mcp-search-proxy:1.0.2
     container_name: mcp-search-proxy
     restart: unless-stopped
     mem_limit: 512m

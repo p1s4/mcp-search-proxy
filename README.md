@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-Streamable_HTTP-blue)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-1.0.1-blue)](#)
+[![Version](https://img.shields.io/badge/version-1.0.2-blue)](#)
 [![Author](https://img.shields.io/badge/author-p1s4-lightgrey)](#)
 
 Search-first MCP proxy for tool-heavy MCP aggregators. Exposes **4 fixed tools** (~2–3k tokens) instead of forwarding hundreds of full input schemas (~180k tokens) into every model turn.

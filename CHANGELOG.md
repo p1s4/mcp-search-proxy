@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-09-17
+
+### Changed
+
+- Full English translation of all user-facing strings: tool descriptions, error
+  messages, hints, server `instructions`, log lines, comments and docstrings.
+  Retrieval logic is bit-identical (verified: code token-stream identical,
+  15/15 ranking parity on the live catalog). `User-Agent` is now
+  `mcp-search-proxy/1.0.2`.
+- Ellipsis truncation in search-result clipping is now ASCII `...` instead of `…`.
+
+### Added
+
+- Explicit anti-pattern guidance: `mcp_refresh` description now reads "Use ONLY
+  when a tool comes back unknown/stale — never before every search/call".
+  Same note in the server `instructions`. The proxy already re-lists once
+  automatically on unknown-tool, so manual refresh before every call only adds
+  downstream load.
+- `mcp_call` description and unknown-tool hints now clarify that a server/source
+  name alone is not callable — pick an exact tool name from `matches[]`.
+
 ## [1.0.1] - 2026-09-15
 
 ### Fixed

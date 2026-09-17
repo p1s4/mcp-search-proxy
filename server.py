@@ -1,15 +1,15 @@
-"""mcp-search-proxy — search-first davanti a LiteLLM MCP.
+"""mcp-search-proxy — search-first in front of MCP upstreams.
 
-OWUI vede solo 4 tool fissi (~2-3k token) invece di 532 schemi full (~179k):
-  mcp_search(query, limit)  -> BM25 su manifest cached (nomi+desc+params, stile Hermes Layer B)
-  mcp_describe(names)      -> full inputSchema solo per N tool
-  mcp_call(name, arguments) -> tools/call proxata a LiteLLM, risultato grezzo a OWUI
-  mcp_refresh()            -> re-list upstream + rebuild indice (reattivo puro, no polling)
+The client sees 4 fixed tools (~2-3k tokens) instead of 532 full schemas (~179k):
+  mcp_search(query, limit)  -> BM25 over cached manifest (names+desc+params, Hermes Layer B style)
+  mcp_describe(names)      -> full inputSchema for N tools only
+  mcp_call(name, arguments) -> tools/call proxied to the owning upstream, raw result back
+  mcp_refresh()            -> upstream re-list + index rebuild (purely reactive, no polling)
 
-Upstream: http://litellm:4000/mcp (DNS Docker, ai-network). Auth Bearer solo proxy->LiteLLM.
-Nomi mcp_* (non tool_*) per evitare il 400 xAI su nome riservato tool_search.
-BM25: k1=1.5 b=0.75, ammissione rarest-token, exact-name=inf (come Hermes catalog.py).
-POC: tokenize lowercase-split (no Snowball/nltk per restare a zero dipendenze extra).
+Upstreams: any MCP server over Streamable HTTP (Docker DNS, e.g. http://litellm:4000/mcp). Bearer auth proxy->upstream only.
+Names are mcp_* (not tool_*) to avoid the xAI 400 on the reserved tool_search name.
+BM25: k1=1.5 b=0.75, rarest-token admission, exact-name=inf (like Hermes catalog.py).
+POC: lowercase-split tokenize (no Snowball/nltk to stay at zero extra dependencies).
 """
 
 import hashlib
@@ -29,7 +29,7 @@ from fastmcp import FastMCP
 # ---------------------------------------------------------------- config
 
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 USER_AGENT = f"mcp-search-proxy/{VERSION}"
 
 
@@ -37,12 +37,12 @@ def _log(msg: str) -> None:
     print(f"[mcp-search-proxy] {msg}", flush=True)
 
 
-# Multi-upstream generico (GitHub-ready): lista N server via env.
-# Formato consigliato: UPSTREAMS=url|token,url|token (token opzionale dopo |).
-# Formato legacy: UPSTREAM_URLS comma-separated + UPSTREAM_TOKENS posizionale.
-# Se UPSTREAMS e settata, IGNORA UPSTREAM_URLS/UPSTREAM_TOKENS/UPSTREAM_URL.
-# Token non contiene "|" ne "," (split entry su ",", coppia sul PRIMO "|").
-# Es. prod legacy: "http://litellm:4000/mcp,http://mcp-a11y-proxy:8101/mcp"
+# Generic multi-upstream (GitHub-ready): N servers via env.
+# Recommended format: UPSTREAMS=url|token,url|token (token optional after |).
+# Legacy format: UPSTREAM_URLS comma-separated + positional UPSTREAM_TOKENS.
+# When UPSTREAMS is set, it IGNORES UPSTREAM_URLS/UPSTREAM_TOKENS/UPSTREAM_URL.
+# Token must not contain "|" or "," (entries split on ",", pair on the FIRST "|").
+# E.g. legacy prod: "http://litellm:4000/mcp,http://mcp-a11y-proxy:8101/mcp"
 MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 _raw_upstreams = os.environ.get("UPSTREAMS", "").strip()
 if _raw_upstreams:
@@ -60,7 +60,7 @@ if _raw_upstreams:
         if not _u:
             continue
         if _u in _cfg_urls:
-            continue  # dedupe preservando ordine (tengo prima occorrenza)
+            continue  # dedupe preserving order (keep first occurrence)
         _cfg_urls.append(_u)
         _cfg_toks.append(_t)
     UPSTREAM_URLS: list[str] = _cfg_urls
@@ -68,15 +68,15 @@ if _raw_upstreams:
 else:
     _raw_urls = os.environ.get("UPSTREAM_URLS", "") or os.environ.get("UPSTREAM_URL", "http://litellm:4000/mcp")
     UPSTREAM_URLS = [u.strip() for u in _raw_urls.split(",") if u.strip()]
-    # dedupe preservando ordine
+    # dedupe preserving order
     _seen: set[str] = set()
     UPSTREAM_URLS = [u for u in UPSTREAM_URLS if not (u in _seen or _seen.add(u))]
-    # Auth per-upstream legacy: UPSTREAM_TOKENS comma-separated, posizionale
-    # rispetto a UPSTREAM_URLS (voce vuota = no-auth). Se assente: MASTER_KEY solo
-    # sugli URL che contengono "litellm", niente altrove (a11y no-auth).
+    # Legacy per-upstream auth: UPSTREAM_TOKENS comma-separated, positional
+    # against UPSTREAM_URLS (empty entry = no-auth). When absent: MASTER_KEY only
+    # on URLs containing "litellm", nothing elsewhere (a11y is no-auth).
     _raw_toks = os.environ.get("UPSTREAM_TOKENS", "")
     _UPSTREAM_TOKENS = [t.strip() for t in _raw_toks.split(",")] if _raw_toks else []
-UPSTREAM_URL = UPSTREAM_URLS[0] if UPSTREAM_URLS else ""  # alias legacy (log, single-upstream compat, riallineato dopo validazione)
+UPSTREAM_URL = UPSTREAM_URLS[0] if UPSTREAM_URLS else ""  # legacy alias (logs, single-upstream compat, realigned after validation)
 
 
 def _scheme_ok(url: str) -> bool:
@@ -87,20 +87,20 @@ def _scheme_ok(url: str) -> bool:
 
 
 def _validate_upstreams() -> None:
-    """Validazione startup: 1 riga per upstream, mai token in chiaro.
-    Scheme non http/https -> WARNING + skip senza crashare (es. typo htps)."""
+    """Startup validation: 1 line per upstream, never log tokens in clear.
+    Non-http/https scheme -> WARNING + skip without crashing (e.g. htps typo)."""
     global UPSTREAM_URLS, _UPSTREAM_TOKENS, UPSTREAM_URL
     valid_urls: list[str] = []
     valid_toks: list[str] = []
     n = len(UPSTREAM_URLS)
     for i, url in enumerate(UPSTREAM_URLS, 1):
         tok = _UPSTREAM_TOKENS[i - 1] if (i - 1) < len(_UPSTREAM_TOKENS) else ""
-        # il fallback legacy MASTER_KEY (solo URL litellm) conta come auth, come in _token_for
+        # the legacy MASTER_KEY fallback (litellm URLs only) counts as auth, as in _token_for
         has_auth = bool(tok) or bool(MASTER_KEY and "litellm" in url)
         ok = _scheme_ok(url)
         _log(f"[{i}/{n}] url={url} scheme_ok={str(ok).lower()} auth={'yes' if has_auth else 'no'}")
         if not ok:
-            _log(f"WARNING: salto upstream {url}: scheme non http/https, controlla typo (es. htps)")
+            _log(f"WARNING: skipping upstream {url}: non-http/https scheme, check for typos (e.g. htps)")
             continue
         valid_urls.append(url)
         valid_toks.append(tok)
@@ -108,29 +108,29 @@ def _validate_upstreams() -> None:
     _UPSTREAM_TOKENS = valid_toks
     UPSTREAM_URL = UPSTREAM_URLS[0] if UPSTREAM_URLS else ""
     if not UPSTREAM_URLS:
-        _log("WARNING: nessun upstream valido configurato, il catalogo restera vuoto fino a fix env + restart")
+        _log("WARNING: no valid upstream configured, catalog will stay empty until env fix + restart")
 
 
 _validate_upstreams()
 MANIFEST_PATH = os.environ.get("MANIFEST_PATH", "/app/data/manifest.json")
 PORT = int(os.environ.get("PORT", "8092"))
-TTL_SEC = int(os.environ.get("CATALOG_TTL_SEC", "1800"))  # 0 = off, solo refresh esplicito/unknown-tool
+TTL_SEC = int(os.environ.get("CATALOG_TTL_SEC", "1800"))  # 0 = off, explicit/unknown-tool refresh only
 PROTOCOL = "2025-06-18"
 
 SEARCH_DEFAULT_LIMIT = 5
 SEARCH_MAX_LIMIT = 25
-SEARCH_MAX_QUERIES_PER_CALL = 7  # allineato a Hermes _MAX_QUERIES_PER_CALL
-DESCRIBE_MAX_NAMES = 10          # allineato a Hermes _MAX_DESCRIBE_NAMES_PER_CALL
+SEARCH_MAX_QUERIES_PER_CALL = 7  # aligned with Hermes _MAX_QUERIES_PER_CALL
+DESCRIBE_MAX_NAMES = 10          # aligned with Hermes _MAX_DESCRIBE_NAMES_PER_CALL
 DESC_CLIP = 500
 CHARS_PER_TOKEN = 4.0
 BM25_K1 = 1.5
 BM25_B = 0.75
 TIER1_SHORT_DESC_LEN = 60
-# Deviazione documentata da Hermes (che è BM25 puro su search-text): le
-# descrizioni di questo catalogo sono in parte in italiano (es. gmail-*),
-# mentre le query del modello sono in inglese. Senza peso sul nome, un doc
-# che ripete 'email/send' nel body batte il tool giusto che li ha nel nome.
-# NAME_BONUS aggiunge 1.0 x idf per ogni query-token presente nel nome.
+# Documented deviation from Hermes (which is pure BM25 over search-text): some
+# catalog descriptions are in Italian (e.g. gmail-*), while model queries are
+# in English. Without name weighting, a doc repeating 'email/send' in the body
+# beats the right tool that has them in the name.
+# NAME_BONUS adds 1.0 x idf per query-token present in the name.
 NAME_BONUS_WEIGHT = 1.0
 
 _token_re = re.compile(r"[A-Za-z0-9]+")
@@ -139,7 +139,7 @@ _split_re = re.compile(r"[_.:\-]+")
 # ---------------------------------------------------------------- state (in-memory, thread-safe)
 
 _LOCK = threading.RLock()
-_TOOLS: list[dict] = []          # schemi full upstream (merge tutti gli upstream)
+_TOOLS: list[dict] = []          # full upstream schemas (merged from all upstreams)
 _BY_NAME: dict[str, dict] = {}
 _DOC_TOKENS: dict[str, list[str]] = {}
 _DF: dict[str, int] = {}
@@ -147,8 +147,8 @@ _AVGDL = 0.0
 _N = 0
 _FINGERPRINT = ""
 _LAST_REFRESH = 0.0
-_SESSIONS: dict[str, str] = {}       # sticky per-upstream: url -> sid (mai mixare)
-_STATELESS: set[str] = set()          # upstream senza sid (initialize 200 senza Mcp-Session-Id): session=None
+_SESSIONS: dict[str, str] = {}       # sticky per-upstream: url -> sid (never mix)
+_STATELESS: set[str] = set()          # upstreams without sid (initialize 200 without Mcp-Session-Id): session=None
 _TOOL_UPSTREAM: dict[str, str] = {}  # routing: tool-name -> upstream url
 
 
@@ -165,10 +165,10 @@ def _estimate_tokens(chars: int) -> int:
 # ---------------------------------------------------------------- upstream JSON-RPC (Streamable HTTP, SSE)
 
 def _token_for(url: str) -> str:
-    """Auth per-upstream (posizionale, fallback legacy).
-    Con UPSTREAMS=url|token: token accoppiato alla entry. Con formato legacy:
-    UPSTREAM_TOKENS comma-separated, stessa posizione di UPSTREAM_URLS
-    (voce vuota = no-auth). Se assente: MASTER_KEY solo su URL litellm."""
+    """Per-upstream auth (positional, legacy fallback).
+    With UPSTREAMS=url|token: token paired to its entry. With legacy format:
+    UPSTREAM_TOKENS comma-separated, same position as UPSTREAM_URLS
+    (empty entry = no-auth). When absent: MASTER_KEY on litellm URLs only."""
     try:
         idx = UPSTREAM_URLS.index(url)
         if idx < len(_UPSTREAM_TOKENS) and _UPSTREAM_TOKENS[idx]:
@@ -184,8 +184,8 @@ def _headers(url: str, session: str | None = None) -> dict:
     h = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
-        # UA esplicito: urllib default "Python-urllib/3.12" e bannato da alcuni
-        # site owner via Cloudflare (error 1010 browser_signature_banned, es. getbooyah).
+        # Explicit UA: urllib default "Python-urllib/3.12" is banned by some
+        # site owners via Cloudflare (error 1010 browser_signature_banned, e.g. getbooyah).
         "User-Agent": USER_AGENT,
     }
     tok = _token_for(url)
@@ -197,8 +197,8 @@ def _headers(url: str, session: str | None = None) -> dict:
 
 
 def _parse_body(body: str) -> list[dict]:
-    """Parse risposta Streamable HTTP: SSE (data: {...}) oppure JSON diretto
-    (alcuni server stateless, es. getbooyah, rispondono application/json puro)."""
+    """Parse a Streamable HTTP response: SSE (data: {...}) or direct JSON
+    (some stateless servers, e.g. getbooyah, answer pure application/json)."""
     out: list[dict] = []
     for line in body.split("\n"):
         line = line.strip()
@@ -227,7 +227,7 @@ def _parse_sse(body: str) -> list[dict]:
 
 
 def _timeout_for(url: str, default: int) -> int:
-    """Timeout per-upstream: a11y dietro nginx ha proxy_read_timeout 300s."""
+    """Per-upstream timeout: a11y behind nginx has proxy_read_timeout 300s."""
     try:
         v = int(os.environ.get("UPSTREAM_TIMEOUT_A11Y", "280"))
     except Exception:
@@ -255,13 +255,13 @@ def _post(url: str, payload: dict, session: str | None, timeout: int) -> tuple[s
 
 
 def _ensure_session(url: str) -> str | None:
-    """Sticky per-upstream: riuso stretto della sid, mai una nuova per call.
-    Per upstream stateful (es. a11y: tab/pagine legati alla sid) questo e il
-    punto che evita il tab-perso visto con LiteLLM il 23 Lug (nuova sessione
-    per ogni call -> pagina navigata non piu disponibile). Reset solo su
-    400/404/session-expired, una volta, poi retry.
-    Upstream stateless (initialize 200 senza Mcp-Session-Id, es. gutenberg):
-    nessuna sid, session=None da qui in poi (header Mcp-Session-Id omesso)."""
+    """Sticky per-upstream: strict sid reuse, never a fresh one per call.
+    For stateful upstreams (e.g. a11y: tabs/pages bound to the sid) this is
+    what avoids the lost-tab seen with LiteLLM on Jul 23 (new session
+    per call -> navigated page no longer available). Reset only on
+    400/404/session-expired, once, then retry.
+    Stateless upstreams (initialize 200 without Mcp-Session-Id, e.g. gutenberg):
+    no sid, session=None from here on (Mcp-Session-Id header omitted)."""
     with _LOCK:
         if url in _STATELESS:
             return None
@@ -278,18 +278,18 @@ def _ensure_session(url: str) -> str | None:
     if not sid:
         with _LOCK:
             _STATELESS.add(url)
-        _log(f"upstream {url} stateless (initialize senza session id), proseguo senza sid")
-        # notifications/initialized best-effort anche senza sid (alcuni server lo vogliono)
+        _log(f"upstream {url} stateless (initialize without session id), continuing without sid")
+        # notifications/initialized best-effort even without sid (some servers want it)
         try:
             _post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session=None, timeout=10)
         except Exception as e:
-            _log(f"initialized notification {url}: {e} (proseguo)")
+            _log(f"initialized notification {url}: {e} (continuing)")
         return None
-    # notifications/initialized (best-effort, 202 atteso)
+    # notifications/initialized (best-effort, 202 expected)
     try:
         _post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session=sid, timeout=10)
     except Exception as e:
-        _log(f"initialized notification {url}: {e} (proseguo)")
+        _log(f"initialized notification {url}: {e} (continuing)")
     with _LOCK:
         _STATELESS.discard(url)
         _SESSIONS[url] = sid
@@ -303,18 +303,18 @@ def _is_stateful(url: str) -> bool:
 
 def _reset_session(url: str) -> None:
     with _LOCK:
-        # stateless: nessun reset/retry sessione, resta in _STATELESS
+        # stateless: no session reset/retry, stays in _STATELESS
         if url in _STATELESS:
             return
         _SESSIONS.pop(url, None)
 
 
 def _tools_list_one(url: str) -> tuple[str, list[dict]]:
-    """tools/list su un singolo upstream. Ritorna (url, tools)."""
+    """tools/list on a single upstream. Returns (url, tools)."""
     try:
         sid = _ensure_session(url)
     except Exception as e:
-        raise RuntimeError(f"initialize fallita verso {url}: {e}") from e
+        raise RuntimeError(f"initialize failed for {url}: {e}") from e
     for attempt in (1, 2):
         try:
             sid_now, msgs, _ = _post(
@@ -331,39 +331,39 @@ def _tools_list_one(url: str) -> tuple[str, list[dict]]:
                 if isinstance(res, dict) and isinstance(res.get("tools"), list):
                     return url, res["tools"]
             err = next((m.get("error") for m in msgs if m.get("error")), None)
-            raise RuntimeError(f"tools/list senza result.tools: {json.dumps(msgs)[:800]} err={err}")
+            raise RuntimeError(f"tools/list without result.tools: {json.dumps(msgs)[:800]} err={err}")
         except RuntimeError as e:
-            # sessione scaduta/invalidata -> reset una volta e retry (solo stateful;
-            # per stateless un 400 e errore normale, niente reset/retry sessione)
+            # expired/invalid session -> reset once and retry (stateful only;
+            # for stateless a 400 is a normal error, no session reset/retry)
             if attempt == 1 and _is_stateful(url) and ("400" in str(e) or "404" in str(e) or "session" in str(e).lower()):
-                _log(f"tools/list {url} retry dopo reset sessione ({e})")
+                _log(f"tools/list {url} retry after session reset ({e})")
                 _reset_session(url)
                 sid = _ensure_session(url)
                 continue
             raise
-    raise RuntimeError(f"tools/list {url}: tentativi esauriti")
+    raise RuntimeError(f"tools/list {url}: attempts exhausted")
 
 
 def _tools_list_live() -> list[tuple[str, list[dict]]]:
-    """Fan-out sequenziale su tutti gli upstream. Ritorna [(url, tools)].
-    Un upstream down non blocca gli altri: log + lista vuota (fail-soft).
-    Se TUTTI falliscono, solleva RuntimeError (fail-closed)."""
+    """Sequential fan-out over all upstreams. Returns [(url, tools)].
+    One upstream down does not block the others: log + empty list (fail-soft).
+    If ALL fail, raise RuntimeError (fail-closed)."""
     results: list[tuple[str, list[dict]]] = []
     errors: list[str] = []
     for url in UPSTREAM_URLS:
         try:
             results.append(_tools_list_one(url))
         except Exception as e:
-            _log(f"tools/list {url} fallita, salto upstream: {e}")
+            _log(f"tools/list {url} failed, skipping upstream: {e}")
             errors.append(f"{url}: {e}")
     if not results:
-        raise RuntimeError(f"tutti gli upstream falliti: {'; '.join(errors)}")
+        raise RuntimeError(f"all upstreams failed: {'; '.join(errors)}")
     return results
 
 
 def _tools_call_live(name: str, arguments: dict, timeout: int = 180) -> dict:
-    """Routing per-tool: la call va all'upstream che ha fornito il tool
-    (mappa _TOOL_UPSTREAM). Fallback: prova in ordine (fail-soft)."""
+    """Per-tool routing: the call goes to the upstream that provided the tool
+    (_TOOL_UPSTREAM map). Fallback: try in order (fail-soft)."""
     with _LOCK:
         preferred = _TOOL_UPSTREAM.get(name)
     urls = [preferred] + [u for u in UPSTREAM_URLS if u != preferred] if preferred else list(UPSTREAM_URLS)
@@ -381,21 +381,21 @@ def _tools_call_live(name: str, arguments: dict, timeout: int = 180) -> dict:
                 for m in msgs:
                     if "result" in m or "error" in m:
                         return m
-                raise RuntimeError(f"tools/call senza result/error: {json.dumps(msgs)[:800]}")
+                raise RuntimeError(f"tools/call without result/error: {json.dumps(msgs)[:800]}")
             except RuntimeError as e:
                 last_err = e
                 if attempt == 1 and _is_stateful(url) and ("400" in str(e) or "404" in str(e) or "session" in str(e).lower()):
-                    _log(f"tools/call {url} retry dopo reset sessione ({e})")
+                    _log(f"tools/call {url} retry after session reset ({e})")
                     _reset_session(url)
                     sid = _ensure_session(url)
                     continue
-                break  # errore non-sessione: passa al prossimo upstream solo se fallback
+                break  # non-session error: move to next upstream only on fallback
         if preferred:
-            break  # routing esplicito: non spillo su altri upstream
-    raise last_err or RuntimeError(f"tools/call '{name}': nessun upstream disponibile")
+            break  # explicit routing: no spillover to other upstreams
+    raise last_err or RuntimeError(f"tools/call '{name}': no upstream available")
 
 
-# ---------------------------------------------------------------- catalogo + BM25
+# ---------------------------------------------------------------- catalog + BM25
 
 def _source_of(name: str) -> str:
     if "-" in name:
@@ -426,14 +426,14 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _stem(tok: str) -> str:
-    """Stemmer manuale minimale EN, zero dipendenze (coerente col POC).
-    Strip leggero s/es/ed/ing con guardia len<4 (evita 'is'->'i').
-    Applicato sia ai doc (via _tokenize in _build_index) sia alle query
-    (via _tokenize in _search_one), altrimenti 'threads' vs 'thread'
-    restano non comparabili. Over-stemming noto: 'created'->'creat'
-    vs 'create'->'create' (divergono); caso raro in query reali, il gate
-    OOV-robusto + limit+describe mitigano. Plurali s/es gestiti con
-    regole sibilanti per evitare 'messages'->'messag' (solo s finale)."""
+    """Minimal hand-rolled EN stemmer, zero dependencies (consistent with the POC).
+    Light s/es/ed/ing stripping with a len<4 guard (avoids 'is'->'i').
+    Applied to both docs (via _tokenize in _build_index) and queries
+    (via _tokenize in _search_one), otherwise 'threads' vs 'thread'
+    stay incomparable. Known over-stemming: 'created'->'creat'
+    vs 'create'->'create' (they diverge); rare in real queries, the
+    OOV-robust gate + limit+describe mitigate it. s/es plurals handled with
+    sibilant rules to avoid 'messages'->'messag' (trailing s only)."""
     if len(tok) < 4:
         return tok
     if len(tok) > 5 and tok.endswith("ing") and len(tok) - 3 >= 4:
@@ -460,10 +460,10 @@ def _stem(tok: str) -> str:
 
 
 def _name_match(qtok: str, ntok: str) -> bool:
-    """Match nome guardato: uguale o qtok sottostringa di ntok (len>=4).
-    Copre 'mail' in 'gmail'/'mailchimp' senza split del tokenizer.
-    Solo direzione query->nome (non viceversa) + guardia len per evitare
-    falsi positivi su token corti generici."""
+    """Guarded name match: equal, or qtok substring of ntok (len>=4).
+    Covers 'mail' in 'gmail'/'mailchimp' without tokenizer splitting.
+    Query->name direction only (not vice versa) + len guard to avoid
+    false positives on short generic tokens."""
     if qtok == ntok:
         return True
     return len(qtok) >= 4 and qtok in ntok
@@ -494,7 +494,7 @@ def _build_index(tools: list[dict], routing: dict[str, str] | None = None) -> No
         _AVGDL = (total_len / _N) if _N else 0.0
         _FINGERPRINT = _fingerprint(_TOOLS)
         if routing is not None:
-            # routing solo per nomi sopravvissuti al dedupe (primo upstream vince)
+            # routing only for names surviving dedupe (first upstream wins)
             _TOOL_UPSTREAM = {n: routing[n] for n in by_name if n in routing}
 
 
@@ -530,19 +530,19 @@ def _search_one(query: str, limit: int) -> list[str]:
     qtoks = _tokenize(query)
     if not qtoks:
         return []
-    # exact-name match = inf (come Hermes)
+    # exact-name match = inf (like Hermes)
     qnorm = query.strip().lower()
     with _LOCK:
         for n in names:
             if n.lower() == qnorm:
                 return [n]
-    # rarest-token gate (come Hermes) con robustezza OOV: la scelta del gate
-    # avviene solo tra token presenti nell'indice (DF>0). Token OOV (refusi,
-    # plurali non stemmingati, parole italiane su descrizioni inglesi e
-    # viceversa) contribuiscono 0 al BM25 ma non devono azzerare i risultati.
-    # Senza Snowball (POC zero-dipendenze) 'threads' non matcha 'thread':
-    # limitazione nota, mitigata da limit+describe. Se nessun token è in
-    # vocabolario, nessun doc può matchare -> [] con hint available_sources.
+    # rarest-token gate (like Hermes) with OOV robustness: gate selection
+    # happens only among tokens present in the index (DF>0). OOV tokens (typos,
+    # unstemmed plurals, Italian words on English descriptions and
+    # vice versa) contribute 0 to BM25 but must not zero out results.
+    # Without Snowball (zero-dependency POC) 'threads' does not match 'thread':
+    # known limitation, mitigated by limit+describe. When no token is in
+    # vocabulary, no doc can match -> [] with an available_sources hint.
     in_vocab = [t for t in set(qtoks) if _DF.get(t, 0) > 0]
     if not in_vocab:
         return []
@@ -556,26 +556,25 @@ def _search_one(query: str, limit: int) -> list[str]:
             for n in names
         ]
     for n, doc, desc in snapshot:
-        # NAME_BONUS bypass sul gate: il gate è scelto sull'intera query e
-        # le description sono in parte in IT mentre le query sono in EN.
-        # Se il token a IDF più alta (es. 'inbox') manca nel doc, il tool
-        # verrebbe scartato prima che il bonus-nome possa salvarlo, anche
-        # se il nome matcha esplicitamente (es. 'gmail' in gmail-*).
-        # name_hit ammette il doc a prescindere dal gate; il ranking
-        # BM25+bonus decide poi l'ordine. name_hit usa _name_match guardato
-        # (substring query->nome, len>=4): 'mail' in 'gmail' ammette i tool
-        # gmail anche se il token 'mail' non è nel doc (il tokenizer non
-        # spezza 'gmail' in 'g'+'mail'). Stessa regola per il bonus sotto.
+        # NAME_BONUS gate bypass: the gate is picked over the whole query and
+        # some descriptions are in IT while queries are in EN.
+        # When the highest-IDF token (e.g. 'inbox') is missing from the doc, the
+        # tool would be dropped before the name bonus could save it, even
+        # when the name matches explicitly (e.g. 'gmail' in gmail-*).
+        # name_hit admits the doc regardless of the gate; the
+        # BM25+bonus ranking then decides the order. name_hit uses guarded
+        # _name_match (query->name substring, len>=4): 'mail' in 'gmail' admits
+        # gmail tools even when the 'mail' token is not in the doc (the tokenizer
+        # does not split 'gmail' into 'g'+'mail'). Same rule for the bonus below.
         name_toks = set(_tokenize(_split_re.sub(" ", n)))
         name_hit = any(_name_match(t, nt) for t in qset for nt in name_toks)
         if gate and gate not in doc and not name_hit:
             continue
         s = _bm25_score(qtoks, doc)
-        # bonus nome: ogni query-token nel nome aggiunge idf x peso.
-        # _name_match guardato: 'mail' in 'gmail' conta (substring nome,
-        # len>=4), ma 'mail' NON matcha 'mailchimp' diversamente da 'gmail'
-        # solo se pesato uguale — il ranking decide: idf(mail) alto e
-        # condiviso, bonus uguale per entrambi, vince BM25 sul body.
+        # name bonus: each query-token in the name adds idf x weight.
+        # Guarded _name_match: 'mail' in 'gmail' counts (name substring,
+        # len>=4); 'mail' also matches 'mailchimp' — ranking decides:
+        # idf(mail) is high and shared, bonus equal for both, BM25 on the body wins.
         bonus = 0.0
         for t in qset:
             for nt in name_toks:
@@ -583,12 +582,12 @@ def _search_one(query: str, limit: int) -> list[str]:
                     bonus += _idf(t)
                     break
         bonus *= NAME_BONUS_WEIGHT
-        # Keyword boost (reimplementazione originale, stdlib only, pesi da
-        # specifica handoff: +50/+20/+3/+1 sopra BM25+NAME_BONUS).
-        # Idea: il match esplicito su nome/descrizione deve pesare contro
-        # body rumorosi (descrizioni lunghe con TF alto su token rari).
-        # Solo boost additivo: nessun gate min_score (da noi top-N, il gate
-        # lo fa il modello). Ammissione e ordinamento invariati.
+        # Keyword boost (original reimplementation, stdlib only, weights from
+        # the handoff spec: +50/+20/+3/+1 on top of BM25+NAME_BONUS).
+        # Idea: the explicit name/description match must weigh against
+        # noisy bodies (long descriptions with high TF on rare tokens).
+        # Additive boost only: no min_score gate (we do top-N here, the model
+        # applies the gate). Admission and ordering unchanged.
         n_lower = n.lower()
         d_lower = desc.lower() if isinstance(desc, str) else ""
         keyword_boost = 0.0
@@ -604,14 +603,14 @@ def _search_one(query: str, limit: int) -> list[str]:
                     keyword_boost += 3.0
                 if term in d_lower:
                     keyword_boost += 1.0
-            # Adattamento al catalogo namespaced provider-operazione
-            # (originale, solo query a singolo token): il boost letterale
-            # +50/+20 pareggia tutti i contender (es. 'mail' in gmail-* e
-            # mailchimp-*, 'search' in WebSearchAndCrawl-* e github-search-*).
-            # L'operazione esatta (suffix dopo -/_) e il provider (prefix
-            # prima di -/_) disambiguano: 'mail' e' suffisso di 'gmail'
-            # (non prefisso di 'mailchimp'), 'search' e' l'operazione esatta
-            # di WebSearchAndCrawl-search (non di search_analytics).
+            # Adaptation to the provider-operation namespaced catalog
+            # (original, single-token queries only): the literal
+            # +50/+20 boost ties all contenders (e.g. 'mail' in gmail-* and
+            # mailchimp-*, 'search' in WebSearchAndCrawl-* and github-search-*).
+            # The exact operation (suffix after -/_) and the provider (prefix
+            # before -/_) disambiguate: 'mail' is a suffix of 'gmail'
+            # (not a prefix of 'mailchimp'), 'search' is the exact operation
+            # of WebSearchAndCrawl-search (not of search_analytics).
             qparts = re.findall(r"[a-z0-9_]+", qnorm)
             if len(qparts) == 1:
                 q1 = qparts[0]
@@ -631,7 +630,7 @@ def _search_one(query: str, limit: int) -> list[str]:
 
 def _clip(s: str, n: int = DESC_CLIP) -> str:
     s = s or ""
-    return s if len(s) <= n else s[:n] + "…"
+    return s if len(s) <= n else s[:n] + "..."
 
 
 def _required_of(tool: dict) -> list[str]:
@@ -660,7 +659,7 @@ def _save_manifest() -> None:
             json.dump(payload, f)
         os.replace(tmp, MANIFEST_PATH)
     except Exception as e:
-        _log(f"save manifest fallita: {e}")
+        _log(f"save manifest failed: {e}")
 
 
 def _load_manifest() -> bool:
@@ -672,30 +671,30 @@ def _load_manifest() -> bool:
             return False
         _build_index(tools, payload.get("routing") or None)
         with _LOCK:
-            # manifest legacy senza routing (single-upstream 1.0.0): tutto al primo upstream
+            # legacy manifest without routing (single-upstream 1.0.0): everything to the first upstream
             if not _TOOL_UPSTREAM and _TOOLS and UPSTREAM_URLS:
                 _TOOL_UPSTREAM.update({t.get("name", ""): UPSTREAM_URLS[0] for t in _TOOLS if t.get("name")})
         global _LAST_REFRESH
         with _LOCK:
             _LAST_REFRESH = float(payload.get("refreshed_at") or 0.0)
-        _log(f"manifest da disco: {_N} tool fp={_FINGERPRINT}")
+        _log(f"manifest from disk: {_N} tool fp={_FINGERPRINT}")
         return True
     except FileNotFoundError:
         return False
     except Exception as e:
-        _log(f"load manifest fallita: {e}")
+        _log(f"load manifest failed: {e}")
         return False
 
 
 def refresh_catalog(force: bool = False) -> dict:
-    """Fetch-once + rebuild. Ritorna stats. Solleva RuntimeError su fallimento.
-    Alla fine aggiorna mcp.instructions col manifest tier-1 (1 riga per
-    source, stile Hermes Tier 1: nome + short-desc). Verificato su
-    fastmcp 3.4.2: FastMCP.instructions ha setter (server.py:445-450,
-    delega a _mcp_server.instructions), quindi mutabile a runtime.
-    Nota: i client leggono instructions all'handshake initialize — un
-    mcp_refresh() a runtime aggiorna il server ma i client già connessi
-    vedono il testo vecchio fino al prossimo handshake."""
+    """Fetch-once + rebuild. Returns stats. Raises RuntimeError on failure.
+    At the end it refreshes mcp.instructions with the tier-1 manifest (1 line per
+    source, Hermes Tier 1 style: name + short-desc). Verified on
+    fastmcp 3.4.2: FastMCP.instructions has a setter (server.py:445-450,
+    delegating to _mcp_server.instructions), so it is runtime-mutable.
+    Note: clients read instructions at the initialize handshake — a
+    runtime mcp_refresh() updates the server but already-connected clients
+    keep seeing the old text until their next handshake."""
     global _LAST_REFRESH
     per_up = _tools_list_live()  # [(url, tools)] fan-out
     merged: list[dict] = []
@@ -707,12 +706,12 @@ def refresh_catalog(force: bool = False) -> dict:
             n = t.get("name", "")
             if not n or n in routing:
                 if n in routing:
-                    _log(f"collisione nome '{n}': tengo {routing[n]}, scarto {url} (fail-closed)")
+                    _log(f"name collision '{n}': keeping {routing[n]}, dropping {url} (fail-closed)")
                 continue
             routing[n] = url
             merged.append(t)
     if not merged:
-        raise RuntimeError("tutti gli upstream hanno ritornato 0 tool")
+        raise RuntimeError("all upstreams returned 0 tools")
     _build_index(merged, routing)
     with _LOCK:
         _LAST_REFRESH = time.time()
@@ -741,15 +740,15 @@ def _stale() -> bool:
 
 
 def _short_desc(text: str, n: int = TIER1_SHORT_DESC_LEN) -> str:
-    """Prima frase, ≤60ch (come Hermes _short_desc in tool_search_catalog.py:185)."""
+    """First sentence, max 60 chars (like Hermes _short_desc in tool_search_catalog.py:185)."""
     t = (text or "").split(".")[0].strip().replace("\n", " ")
     return t if len(t) <= n else t[:n]
 
 
 def _tier1_listing() -> str:
-    """Manifest tier-1: 1 riga per source 'nome: short-desc', sorted byte-stable
-    (prompt-cache safe, come Hermes). 21 righe / ~1.3kch / ~340tok misurati
-    sul catalogo reale fp 532:6eee51ac20cd1972."""
+    """Tier-1 manifest: 1 line per source 'name: short-desc', sorted byte-stable
+    (prompt-cache safe, like Hermes). Measured 21 lines / ~1.3k chars / ~340 tok
+    on the real fp 532:6eee51ac20cd1972 catalog."""
     with _LOCK:
         items = list(_BY_NAME.items())
     from collections import Counter
@@ -769,13 +768,13 @@ def _update_instructions() -> None:
         with _LOCK:
             n = _N
         mcp.instructions = (
-            f"Proxy search-first davanti a {len(UPSTREAM_URLS)} upstream MCP ({n} tool). "
-            "Flusso: mcp_search per trovare i nomi, mcp_describe per gli schemi full, "
-            "mcp_call per eseguire. mcp_refresh solo se un tool risulta unknown o datato.\n"
-            f"Catalogo per server:\n{listing}"
+            f"Search-first proxy in front of {len(UPSTREAM_URLS)} MCP upstreams ({n} tools). "
+            "Flow: mcp_search to find names, mcp_describe for full schemas, "
+            "mcp_call to execute. mcp_refresh only when a tool comes back unknown or stale — never refresh before every call.\n"
+            f"Catalog by server:\n{listing}"
         )
     except Exception as e:
-        _log(f"update instructions fallito: {e}")
+        _log(f"update instructions failed: {e}")
 
 
 def _ensure_catalog() -> None:
@@ -786,17 +785,17 @@ def _ensure_catalog() -> None:
             refresh_catalog(force=True)
         else:
             _update_instructions()
-            # manifest su disco ma verifichiamo upstream se TTL scaduto
+            # manifest on disk but we still check upstream when TTL is stale
             if _stale():
                 try:
                     refresh_catalog(force=True)
                 except Exception as e:
-                    _log(f"refresh TTL fallito, uso manifest disco: {e}")
+                    _log(f"TTL refresh failed, using disk manifest: {e}")
     elif _stale():
         try:
             refresh_catalog(force=True)
         except Exception as e:
-            _log(f"refresh TTL fallito, uso catalogo memoria: {e}")
+            _log(f"TTL refresh failed, using in-memory catalog: {e}")
 
 
 # ---------------------------------------------------------------- FastMCP
@@ -805,39 +804,39 @@ def _ensure_catalog() -> None:
 async def _lifespan(app):
     try:
         if not _load_manifest():
-            _log("nessun manifest, fetch iniziale upstream…")
+            _log("no manifest, initial upstream fetch...")
             refresh_catalog(force=True)
         else:
-            _log(f"avvio con manifest disco ({_N} tool), verifica upstream best-effort…")
+            _log(f"starting with disk manifest ({_N} tools), best-effort upstream check...")
             try:
                 refresh_catalog(force=True)
             except Exception as e:
-                _log(f"fetch iniziale fallita, resto su manifest disco: {e}")
+                _log(f"initial fetch failed, staying on disk manifest: {e}")
                 _update_instructions()
     except Exception as e:
-        _log(f"lifespan: catalogo non disponibile all'avvio: {e}")
+        _log(f"lifespan: catalog unavailable at startup: {e}")
     yield
 
 
 mcp = FastMCP(
     name="mcp-search-proxy",
     instructions=(
-        "Proxy search-first davanti a LiteLLM MCP (532 tool). "
-        "Flusso: mcp_search per trovare i nomi, mcp_describe per gli schemi full, "
-        "mcp_call per eseguire. mcp_refresh solo se un tool risulta unknown o datato."
+        "Search-first proxy in front of MCP upstreams. "
+        "Flow: mcp_search to find names, mcp_describe for full schemas, "
+        "mcp_call to execute. mcp_refresh only when a tool comes back unknown or stale — never refresh before every call."
     ),
     lifespan=_lifespan,
 )
 
 
-@mcp.tool(description="Cerca tool MCP per argomento (BM25 su nomi+descrizioni+parametri). Ritorna nomi + mini-schede, mai schemi full. Se i top risultati condividono lo stesso prefisso (es. tutti thread_*) e la query ha piu intenti, riprova con limit piu alto (es. 10).")
+@mcp.tool(description="Search MCP tools by topic (BM25 over names+descriptions+params). Returns names + mini-cards, never full schemas. If top results share one prefix (e.g. all thread_*) and the query has multiple intents, retry with a higher limit (e.g. 10).")
 def mcp_search(query: str, limit: int = SEARCH_DEFAULT_LIMIT) -> dict:
     _ensure_catalog()
-    if isinstance(query, list):  # tolleranza: lista -> prima voce
+    if isinstance(query, list):  # tolerance: list -> first entry
         query = query[0] if query else ""
     query = (query or "").strip()
     if not query:
-        return {"ok": False, "error": "query vuota", "hint": "es: 'gmail send', 'github issue', 'calendar event'"}
+        return {"ok": False, "error": "empty query", "hint": "e.g. 'gmail send', 'github issue', 'calendar event'"}
     try:
         limit = int(limit)
     except Exception:
@@ -865,21 +864,21 @@ def mcp_search(query: str, limit: int = SEARCH_DEFAULT_LIMIT) -> dict:
             c = Counter(_source_of(n) for n in _BY_NAME)
             out["available_sources"] = [{"name": k, "tool_count": v}
                                         for k, v in sorted(c.items())]
-            out["hint"] = ("nessun match lessicale: prova sinonimi o termini inglesi "
-                           "(es. 'email' invece di 'posta'), oppure mcp_refresh se il catalogo è datato")
+            out["hint"] = ("no lexical match: try synonyms or English terms "
+                           "(e.g. 'email' instead of 'posta'), or mcp_refresh if the catalog is stale")
     return out
 
 
-@mcp.tool(description="Schemi input full solo per i nomi indicati (max 10/call). Se vedi il nome esatto nel listing, salta mcp_search e vieni qui.")
+@mcp.tool(description="Full input schemas only for the listed names (max 10/call). If you see the exact name in the listing, skip mcp_search and come straight here.")
 def mcp_describe(names: list[str]) -> dict:
     _ensure_catalog()
     if isinstance(names, str):
         names = [names]
     names = [str(x) for x in (names or []) if str(x).strip()]
     if not names:
-        return {"ok": False, "error": "names vuota"}
+        return {"ok": False, "error": "empty names"}
     if len(names) > DESCRIBE_MAX_NAMES:
-        return {"ok": False, "error": f"max {DESCRIBE_MAX_NAMES} nomi per call", "received": len(names)}
+        return {"ok": False, "error": f"max {DESCRIBE_MAX_NAMES} names per call", "received": len(names)}
     seen, uniq = set(), []
     for n in names:
         if n not in seen:
@@ -897,66 +896,66 @@ def mcp_describe(names: list[str]) -> dict:
                             "parameters": t.get("inputSchema", {"type": "object"})}
     out: dict = {"ok": True, "tools": tools, "not_found": not_found, "errors": {}}
     if not_found:
-        out["hint"] = "usa mcp_search per i nomi corretti, o mcp_refresh se il catalogo è datato"
+        out["hint"] = "use mcp_search for the correct names, or mcp_refresh if the catalog is stale"
     return out
 
 
-@mcp.tool(description="Esegue un tool MCP sull'upstream che lo fornisce e ritorna il risultato grezzo. Valida i required in locale prima dell'invio.")
+@mcp.tool(description="Execute an MCP tool on the upstream that provides it and return the raw result. Validates required params locally before sending. Needs the exact tool name from mcp_search — a server/source name alone is not callable.")
 def mcp_call(name: str, arguments: dict | str | None = None) -> dict:
     _ensure_catalog()
     name = (name or "").strip()
     if not name:
-        return {"ok": False, "error": "name vuoto"}
+        return {"ok": False, "error": "empty name"}
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments) if arguments.strip() else {}
         except json.JSONDecodeError as e:
-            return {"ok": False, "error": f"arguments non è JSON valido: {e}"}
+            return {"ok": False, "error": f"arguments is not valid JSON: {e}"}
     if arguments is None:
         arguments = {}
     if not isinstance(arguments, dict):
-        return {"ok": False, "error": "arguments deve essere un oggetto JSON"}
+        return {"ok": False, "error": "arguments must be a JSON object"}
 
     with _LOCK:
         tool = _BY_NAME.get(name)
     if tool is None:
-        # reattivo puro: una re-list una tantum su unknown-tool, poi retry
+        # purely reactive: one-shot re-list on unknown-tool, then retry
         try:
             before = _FINGERPRINT
             refresh_catalog(force=True)
             with _LOCK:
                 tool = _BY_NAME.get(name)
-            _log(f"unknown-tool '{name}': re-list fp {before}->{_FINGERPRINT}")
+            _log(f"unknown tool '{name}': re-list fp {before}->{_FINGERPRINT}")
         except Exception as e:
-            return {"ok": False, "error": f"tool '{name}' sconosciuto e refresh fallito: {e}",
-                    "hint": "usa mcp_search per trovare il nome corretto"}
+            return {"ok": False, "error": f"tool '{name}' unknown and refresh failed: {e}",
+                    "hint": "use mcp_search to find the correct name (a server/source name alone is not callable — pick an exact tool name from matches[])"}
         if tool is None:
-            return {"ok": False, "error": f"tool '{name}' sconosciuto anche dopo refresh",
-                    "hint": "usa mcp_search per trovare il nome corretto"}
+            return {"ok": False, "error": f"tool '{name}' unknown even after refresh",
+                    "hint": "use mcp_search to find the correct name (a server/source name alone is not callable — pick an exact tool name from matches[])"}
 
-    # validazione required locale (fail-open su $ref esterni, come Hermes validation.py)
+    # local required validation (fail-open on external $refs, like Hermes validation.py)
     try:
         schema = tool.get("inputSchema") or {}
         required = schema.get("required") or []
         missing = [r for r in required if r not in arguments]
         if missing:
-            return {"ok": False, "error": f"parametri required mancanti: {missing}",
+            return {"ok": False, "error": f"missing required params: {missing}",
                     "required": [str(x) for x in required],
-                    "hint": "usa mcp_describe per lo schema full"}
+                    "hint": "use mcp_describe for the full schema"}
     except Exception:
         pass  # fail-open
 
     try:
         msg = _tools_call_live(name, arguments)
     except Exception as e:
-        return {"ok": False, "error": f"upstream tools/call fallita: {e}"}
+        return {"ok": False, "error": f"upstream tools/call failed: {e}"}
     if isinstance(msg, dict) and msg.get("error"):
         return {"ok": False, "error": msg["error"], "raw": msg}
     result = msg.get("result", msg) if isinstance(msg, dict) else msg
     return {"ok": True, "tool": name, "result": result}
 
 
-@mcp.tool(description="Re-list di tutti gli upstream + rebuild indice BM25. Usala se un tool risulta unknown/datato. Ritorna count/chars/fingerprint.")
+@mcp.tool(description="Re-list all upstreams + rebuild the BM25 index. Use ONLY when a tool comes back unknown/stale — never before every search/call. Returns count/chars/fingerprint.")
 def mcp_refresh() -> dict:
     try:
         stats = refresh_catalog(force=True)
@@ -969,5 +968,5 @@ def mcp_refresh() -> dict:
 
 if __name__ == "__main__":
     level = os.environ.get("LOG_LEVEL", "INFO")
-    _log(f"avvio su 0.0.0.0:{PORT}/mcp -> {len(UPSTREAM_URLS)} upstream {UPSTREAM_URLS} (TTL {TTL_SEC}s)")
+    _log(f"listening on 0.0.0.0:{PORT}/mcp -> {len(UPSTREAM_URLS)} upstreams {UPSTREAM_URLS} (TTL {TTL_SEC}s)")
     mcp.run(transport="streamable-http", host="0.0.0.0", port=PORT, path="/mcp", log_level=level)
