@@ -29,7 +29,7 @@ from fastmcp import FastMCP
 # ---------------------------------------------------------------- config
 
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 USER_AGENT = f"mcp-search-proxy/{VERSION}"
 
 
@@ -415,7 +415,17 @@ def _entry_search_text(tool: dict) -> str:
     try:
         props = (tool.get("inputSchema") or {}).get("properties") or {}
         if isinstance(props, dict):
-            parts.append(" ".join(str(k).replace("_", " ") for k in list(props.keys())[:60]))
+            keys = list(props.keys())[:60]
+            parts.append(" ".join(str(k).replace("_", " ") for k in keys))
+            descs = []
+            for k in keys:
+                v = props.get(k)
+                if isinstance(v, dict):
+                    d = v.get("description")
+                    if d:
+                        descs.append(str(d))
+            if descs:
+                parts.append(" ".join(descs))
     except Exception:
         pass
     return "\n".join(parts)
