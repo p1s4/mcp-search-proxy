@@ -29,7 +29,7 @@ from fastmcp import FastMCP
 # ---------------------------------------------------------------- config
 
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 USER_AGENT = f"mcp-search-proxy/{VERSION}"
 
 
@@ -126,6 +126,9 @@ CHARS_PER_TOKEN = 4.0
 BM25_K1 = 1.5
 BM25_B = 0.75
 TIER1_SHORT_DESC_LEN = 60
+TIER1_NOTE_LEN = 200       # upstream server-note clip (tier-1 level 1/2)
+TIER1_FALLBACK_LEN = 80    # medoid description clip (tier-1 level 3)
+TIER1_TRY_KW = 5           # try-keywords per row, extracted from tool names
 # Documented deviation from Hermes (which is pure BM25 over search-text): some
 # catalog descriptions are in Italian (e.g. gmail-*), while model queries are
 # in English. Without name weighting, a doc repeating 'email/send' in the body
@@ -150,6 +153,7 @@ _LAST_REFRESH = 0.0
 _SESSIONS: dict[str, str] = {}       # sticky per-upstream: url -> sid (never mix)
 _STATELESS: set[str] = set()          # upstreams without sid (initialize 200 without Mcp-Session-Id): session=None
 _TOOL_UPSTREAM: dict[str, str] = {}  # routing: tool-name -> upstream url
+_UPSTREAM_INSTRUCTIONS: dict[str, str] = {}  # upstream url -> initialize instructions (server notes)
 
 
 def _fingerprint(tools: list[dict]) -> str:
@@ -275,6 +279,7 @@ def _ensure_session(url: str) -> str | None:
                     "clientInfo": {"name": "mcp-search-proxy", "version": VERSION}}},
         session=None, timeout=20,
     )
+    _remember_instructions(url, msgs)
     if not sid:
         with _LOCK:
             _STATELESS.add(url)
@@ -294,6 +299,48 @@ def _ensure_session(url: str) -> str | None:
         _STATELESS.discard(url)
         _SESSIONS[url] = sid
         return sid
+
+
+def _remember_instructions(url: str, msgs: list) -> None:
+    """Save upstream initialize instructions (server notes) for tier-1.
+    The initialize result already arrives here; we keep only the text."""
+    try:
+        for m in msgs or []:
+            res = m.get("result") if isinstance(m, dict) else None
+            if isinstance(res, dict) and isinstance(res.get("instructions"), str):
+                text = res["instructions"].strip()
+                if text:
+                    with _LOCK:
+                        _UPSTREAM_INSTRUCTIONS[url] = text
+                return
+    except Exception as e:
+        _log(f"remember instructions {url} failed: {e}")
+
+
+def _refresh_upstream_instructions() -> None:
+    """Re-run initialize on every upstream to refresh server notes.
+    _ensure_session reuses the cached sid, so without this the notes would
+    stay stale across refreshes. The probe session is DISCARDED: the live
+    sticky sid (a11y tabs/pages) is always restored, never replaced.
+    Best-effort: one call per upstream, fail-soft."""
+    for url in UPSTREAM_URLS:
+        try:
+            with _LOCK:
+                old = _SESSIONS.get(url)
+            _, msgs, _ = _post(
+                url,
+                {"jsonrpc": "2.0", "id": "init-notes", "method": "initialize",
+                 "params": {"protocolVersion": PROTOCOL, "capabilities": {},
+                            "clientInfo": {"name": "mcp-search-proxy", "version": VERSION}}},
+                session=None, timeout=20,
+            )
+            _remember_instructions(url, msgs)
+            # NOTE: new probe sid (if any) is intentionally dropped — the
+            # pre-existing sticky session in _SESSIONS stays authoritative.
+            # The orphan probe session expires server-side (no initialized sent).
+            _log(f"refreshed server notes for {url} (sticky session preserved)")
+        except Exception as e:
+            _log(f"refresh instructions {url} failed (keeping previous): {e}")
 
 
 def _is_stateful(url: str) -> bool:
@@ -677,6 +724,7 @@ def _save_manifest() -> None:
                 "refreshed_at": _LAST_REFRESH,
                 "upstreams": list(UPSTREAM_URLS),
                 "routing": dict(_TOOL_UPSTREAM),
+                "upstream_instructions": dict(_UPSTREAM_INSTRUCTIONS),
                 "tools": _TOOLS,
             }
         tmp = MANIFEST_PATH + ".tmp"
@@ -696,6 +744,7 @@ def _load_manifest() -> bool:
             return False
         _build_index(tools, payload.get("routing") or None)
         with _LOCK:
+            _UPSTREAM_INSTRUCTIONS.update(payload.get("upstream_instructions") or {})
             # legacy manifest without routing (single-upstream 1.0.0): everything to the first upstream
             if not _TOOL_UPSTREAM and _TOOLS and UPSTREAM_URLS:
                 _TOOL_UPSTREAM.update({t.get("name", ""): UPSTREAM_URLS[0] for t in _TOOLS if t.get("name")})
@@ -714,7 +763,7 @@ def _load_manifest() -> bool:
 def refresh_catalog(force: bool = False) -> dict:
     """Fetch-once + rebuild. Returns stats. Raises RuntimeError on failure.
     At the end it refreshes mcp.instructions with the tier-1 manifest (1 line per
-    source, Hermes Tier 1 style: name + short-desc). Verified on
+    source: upstream server note or medoid short-desc + try keywords). Verified on
     fastmcp 3.4.2: FastMCP.instructions has a setter (server.py:445-450,
     delegating to _mcp_server.instructions), so it is runtime-mutable.
     Note: clients read instructions at the initialize handshake — a
@@ -740,6 +789,7 @@ def refresh_catalog(force: bool = False) -> dict:
     _build_index(merged, routing)
     with _LOCK:
         _LAST_REFRESH = time.time()
+    _refresh_upstream_instructions()
     _save_manifest()
     _update_instructions()
     total_chars = len(json.dumps(_TOOLS))
@@ -764,27 +814,205 @@ def _stale() -> bool:
     return (time.time() - last) > TTL_SEC
 
 
+def _word_clip(text: str, n: int) -> str:
+    """First non-empty line, word-boundary clip at n chars + ellipsis (1.0.5).
+    Line-based (not sentence-based): immune to abbreviations/domains
+    ('Next.js', 'notebook.google.com', 'e.g.') that broke the naive
+    split('.') simulation. Fixes also the mid-word cut of _short_desc."""
+    first = ""
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s:
+            first = s
+            break
+    t = " ".join(first.split())  # collapse double spaces
+    if len(t) <= n:
+        return t
+    cut = t[:n].rsplit(" ", 1)[0] or t[:n]
+    return cut.rstrip(",;:") + "\u2026"
+
+
 def _short_desc(text: str, n: int = TIER1_SHORT_DESC_LEN) -> str:
-    """First sentence, max 60 chars (like Hermes _short_desc in tool_search_catalog.py:185)."""
-    t = (text or "").split(".")[0].strip().replace("\n", " ")
-    return t if len(t) <= n else t[:n]
+    """First sentence, max n chars with word-boundary (like Hermes
+    _short_desc in tool_search_catalog.py:185, plus word-boundary fix)."""
+    return _word_clip(text, n)
+
+
+_TIER1_TRY_STOP = frozenset(
+    "get list create update delete set add run fetch search show check make do "
+    "use with for and the tool tools data info new all api mcp of to on in by from into via per "
+    "google workspace".split()
+)
+
+
+def _source_keywords(names: list[str], source: str, k: int = TIER1_TRY_KW) -> list[str]:
+    """Top-k tokens from tool names (prefix stripped), stopwords/CRUD removed.
+    Deterministic: same manifest -> same keywords. Recomputed at each refresh,
+    so adding/removing an MCP updates the row with zero manual maintenance."""
+    from collections import Counter
+    c: Counter = Counter()
+    slow = source.lower()
+    for n in names:
+        body = n[len(source):] if n.startswith(source) else n
+        for tok in _token_re.findall(body.lower()):
+            if len(tok) < 3 or tok in _TIER1_TRY_STOP or tok == slow:
+                continue
+            c[tok] += 1
+    return [w for w, _ in c.most_common(k)]
+
+
+def _parse_server_notes(text: str) -> dict[str, str]:
+    """Split upstream instructions into {source: note} on ^[name] blocks.
+    Text without blocks returns {} (caller treats it as wildcard)."""
+    notes: dict[str, str] = {}
+    if not text or "[" not in text:
+        return notes
+    cur: str | None = None
+    buf: list[str] = []
+
+    def flush() -> None:
+        if cur and buf:
+            notes[cur] = "\n".join(buf).strip()
+
+    for line in text.splitlines():
+        m = re.match(r"^\[([^\]]+)\]\s*$", line.strip())
+        if m:
+            flush()
+            cur = m.group(1)
+            buf = []
+        elif cur is not None:
+            buf.append(line)
+    flush()
+    return notes
+
+
+def _tier1_notes() -> dict[str, str]:
+    """Merge upstream server notes: [source] blocks win; block-less text
+    applies as wildcard ONLY when its URL serves a single source.
+    Multi-source wildcard (e.g. a11y text cloned on audit+browser+scan)
+    is ambiguous -> blocked, those sources fall back to medoid desc."""
+    with _LOCK:
+        instr = dict(_UPSTREAM_INSTRUCTIONS)
+        routing = dict(_TOOL_UPSTREAM)
+    notes: dict[str, str] = {}
+    wild: dict[str, str] = {}  # url -> text (no blocks)
+    for url, text in instr.items():
+        parsed = _parse_server_notes(text)
+        if parsed:
+            for s, note in parsed.items():
+                notes.setdefault(s, note)
+        elif text.strip():
+            wild[url] = text.strip()
+    if wild:
+        url_of: dict[str, str] = {}
+        for tool, url in routing.items():
+            url_of.setdefault(_source_of(tool), url)
+        from collections import Counter
+        per_url = Counter(url_of.values())
+        for s, url in url_of.items():
+            if s not in notes and url in wild and per_url[url] == 1:
+                notes[s] = wild[url]
+    return notes
+
+
+_GW_SVC_ALIASES: dict[str, str] = {
+    # token -> canonical service row
+    "gmail": "gmail",
+    "drive": "drive",
+    "calendar": "calendar", "calendars": "calendar",
+    "event": "calendar", "events": "calendar",
+    "freebusy": "calendar", "focus": "calendar", "office": "calendar",
+    "doc": "docs", "docs": "docs",
+    "sheet": "sheets", "sheets": "sheets",
+    "slide": "slides", "slides": "slides",
+    "task": "task", "tasks": "task",
+}
+
+
+def _gw_service(tool_name: str, source: str = "Google_Workspace") -> str:
+    """Canonical service for a Google_Workspace tool, scanning all tokens
+    after the prefix (verb-agnostic). '' when no known service token."""
+    rest = tool_name[len(source):].lstrip("-_") if tool_name.startswith(source) else tool_name
+    for tok in [p.lower() for p in re.split(r"[-_]+", rest) if p]:
+        if tok in _GW_SVC_ALIASES:
+            return _GW_SVC_ALIASES[tok]
+    return ""
+
+
+def _tier1_needs_split(source: str) -> bool:
+    """True when a source mixes several known services (Google_Workspace:
+    gmail/drive/calendar/docs/sheets/slides/task). The split itself happens
+    in _tier1_listing; this is only the gate."""
+    with _LOCK:
+        names = [n for n in _BY_NAME if _source_of(n) == source]
+    if len(names) < 5:
+        return False
+    services = {_gw_service(n, source) for n in names}
+    return "" not in services and len(services) >= 2
 
 
 def _tier1_listing() -> str:
-    """Tier-1 manifest: 1 line per source 'name: short-desc', sorted byte-stable
-    (prompt-cache safe, like Hermes). Measured 21 lines / ~1.3k chars / ~340 tok
-    on the real fp 532:6eee51ac20cd1972 catalog."""
+    """Tier-1 manifest: 1 line per source 'name: phrase | try: kw (N tool)',
+    sorted byte-stable (prompt-cache safe, like Hermes). Phrase priority:
+    1) upstream server note ([source] block, clipped to TIER1_NOTE_LEN),
+    2) medoid tool description (tool whose name holds most top keywords),
+    clipped to TIER1_FALLBACK_LEN. Google_Workspace (gmail/drive/calendar/
+    task in one source) is split into one row per service."""
     with _LOCK:
         items = list(_BY_NAME.items())
     from collections import Counter
+    by_source: dict[str, list[str]] = {}
+    for n, _ in items:
+        by_source.setdefault(_source_of(n), []).append(n)
     counts = Counter(_source_of(n) for n, _ in items)
-    first: dict[str, str] = {}
-    for n, t in sorted(items):
-        s = _source_of(n)
-        if s not in first:
-            first[s] = _short_desc(t.get("description", ""))
-    lines = [f"- {s}: {first[s]} ({counts[s]} tool)" for s in sorted(first)]
-    return "\n".join(lines)
+    notes = _tier1_notes()
+    # per-source rows: (sort_key, text); Google_Workspace splits per service
+    rows: dict[str, str] = {}
+    for s in sorted(by_source):
+        names = by_source[s]
+        kws = _source_keywords(names, s)
+        try_part = f" | try: {', '.join(kws)}" if kws else ""
+        if s == "Google_Workspace" and _tier1_needs_split(s):
+            # split gmail/drive/calendar/docs/sheets/slides/task into sub-rows
+            # (verb-agnostic: event/freebusy/focus/out_of_office -> calendar)
+            subs: dict[str, list[str]] = {}
+            for n in names:
+                svc = _gw_service(n, s) or "other"
+                subs.setdefault(svc, []).append(n)
+            for svc in sorted(subs):
+                snames = subs[svc]
+                skws = _source_keywords(snames, f"{s}_{svc}")
+                stry = f" | try: {', '.join(skws)}" if skws else ""
+                # medoid: most keyword hits in name, tie-break longest desc
+                if skws:
+                    def _key(n: str) -> tuple:
+                        with _LOCK:
+                            d = (_BY_NAME.get(n) or {}).get("description", "") or ""
+                        return (sum(1 for k in skws if k in n.lower()), len(d))
+                    best = max(sorted(snames), key=_key)
+                else:
+                    best = sorted(snames)[0]
+                with _LOCK:
+                    bdesc = (_BY_NAME.get(best) or {}).get("description", "")
+                phrase = _word_clip(bdesc, TIER1_FALLBACK_LEN)
+                rows[f"{s}-{svc}"] = f"- {s} ({svc}): {phrase}{stry} ({len(snames)} tool)"
+            continue
+        if s in notes:
+            phrase = _word_clip(notes[s], TIER1_NOTE_LEN)
+        else:
+            if kws:
+                def _key(n: str) -> tuple:
+                    with _LOCK:
+                        d = (_BY_NAME.get(n) or {}).get("description", "") or ""
+                    return (sum(1 for k in kws if k in n.lower()), len(d))
+                best = max(sorted(names), key=_key)
+            else:
+                best = sorted(names)[0]
+            with _LOCK:
+                bdesc = (_BY_NAME.get(best) or {}).get("description", "")
+            phrase = _word_clip(bdesc, TIER1_FALLBACK_LEN)
+        rows[s] = f"- {s}: {phrase}{try_part} ({counts[s]} tool)"
+    return "\n".join(rows[k] for k in sorted(rows))
 
 
 def _update_instructions() -> None:

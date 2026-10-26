@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-10-26
+
+### Changed
+
+- Tier-1 listing now prefers real upstream `instructions` (server notes captured at `initialize`, refreshed on `mcp_refresh`) over truncated medoid descriptions; fallback medoid 80ch + `try:` keywords. `Google_Workspace` split into one row per service (gmail/drive/calendar/docs/sheets/slides/task, verb-agnostic).
+- Clip helper `_word_clip`: first non-empty line, word-boundary clip + ellipsis (fixes mid-word cut of `_short_desc`, immune to `Next.js`/`notebook.google.com`/`e.g.`).
+
+### Fixed
+
+- Sticky-session safe notes refresh: probe `initialize` per upstream, probe sid discarded, live sticky sid (a11y tabs/pages) always restored; best-effort fail-soft per upstream.
+
 ## [1.0.4] - 2026-10-26
 
 ### Added
