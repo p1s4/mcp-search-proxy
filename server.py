@@ -29,7 +29,7 @@ from fastmcp import FastMCP
 # ---------------------------------------------------------------- config
 
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 USER_AGENT = f"mcp-search-proxy/{VERSION}"
 
 
@@ -469,6 +469,15 @@ def _name_match(qtok: str, ntok: str) -> bool:
     return len(qtok) >= 4 and qtok in ntok
 
 
+def _segments(name: str) -> list[str]:
+    """Provider-operation segments: split on -/_ (lowercased, len>=3 only).
+    e.g. 'Clickup-create_issue' -> ['clickup', 'create', 'issue'];
+    'wsc_mcp-search' -> ['wsc', 'mcp', 'search'].
+    Exact segment equality (len>=3) admits 'issue' -> 'create_issue'
+    without substring noise ('api' equals 'api', never matches 'rapid')."""
+    return [p for p in re.split(r"[-_]+", name.lower()) if len(p) >= 3]
+
+
 def _build_index(tools: list[dict], routing: dict[str, str] | None = None) -> None:
     global _TOOLS, _BY_NAME, _DOC_TOKENS, _DF, _AVGDL, _N, _FINGERPRINT, _TOOL_UPSTREAM
     by_name: dict[str, dict] = {}
@@ -616,9 +625,15 @@ def _search_one(query: str, limit: int) -> list[str]:
                 q1 = qparts[0]
                 op_lower = n.rsplit("-", 1)[-1].lower() if "-" in n else n.rsplit("_", 1)[-1].lower()
                 src_lower = _source_of(n).lower()
-                if q1 == op_lower:
+                # Segment-match (Punto 1, 2026-10-26): the operation may be
+                # compound ('create_issue'); split on _ so 'issue' matches
+                # the exact segment. Same for compound sources ('wsc_mcp').
+                # Len>=3 guard: no boost on 1-2ch tokens.
+                op_segs = _segments(op_lower)
+                src_segs = _segments(src_lower)
+                if len(q1) >= 3 and (q1 == op_lower or q1 in op_segs):
                     keyword_boost += 30.0
-                if q1 == src_lower:
+                if len(q1) >= 3 and (q1 == src_lower or q1 in src_segs):
                     keyword_boost += 15.0
                 elif len(q1) >= 4 and src_lower.endswith(q1) and q1 != src_lower:
                     keyword_boost += 12.0
@@ -770,7 +785,8 @@ def _update_instructions() -> None:
         mcp.instructions = (
             f"Search-first proxy in front of {len(UPSTREAM_URLS)} MCP upstreams ({n} tools). "
             "Flow: mcp_search to find names, mcp_describe for full schemas, "
-            "mcp_call to execute. mcp_refresh only when a tool comes back unknown or stale — never refresh before every call.\n"
+            "mcp_call to execute. mcp_refresh only when a tool comes back unknown or stale — never refresh before every call. "
+            "Never tell the user a capability is unavailable without searching first.\n"
             f"Catalog by server:\n{listing}"
         )
     except Exception as e:
@@ -823,7 +839,8 @@ mcp = FastMCP(
     instructions=(
         "Search-first proxy in front of MCP upstreams. "
         "Flow: mcp_search to find names, mcp_describe for full schemas, "
-        "mcp_call to execute. mcp_refresh only when a tool comes back unknown or stale — never refresh before every call."
+        "mcp_call to execute. mcp_refresh only when a tool comes back unknown or stale — never refresh before every call. "
+        "Never tell the user a capability is unavailable without searching first."
     ),
     lifespan=_lifespan,
 )

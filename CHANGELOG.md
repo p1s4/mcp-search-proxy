@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-10-26
+
+### Fixed
+
+- Compound-operation search: single-word queries now match exact name
+  segments (`issue` -> `create_issue`, `task` -> `create_task`). The previous
+  code compared against the whole operation string, so any compound operation
+  missed the +30 keyword boost. Match is segment equality with a len>=3
+  guard — no substring noise (`api` still does not match `rapid`).
+- Same segment-match on the provider/source label: compound sources like
+  `wsc_mcp` split into segments, so `mcp` earns the +15 source boost.
+
+### Added
+
+- Anti-skip instruction in server `instructions` (dynamic + initial):
+  "Never tell the user a capability is unavailable without searching first."
+  Already-connected clients see the old text until reconnect.
+
 ## [1.0.2] - 2026-09-17
 
 ### Changed
