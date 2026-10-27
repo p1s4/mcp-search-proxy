@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] - 2026-10-27
+
+### Changed
+
+- Multi-token provider/operation boost: each query token (len>=3) matching the
+  operation segment (+10) or the provider/source label (+6, suffix +4)
+  disambiguates multi-intent queries where the old single-token branch never
+  fired. Weights stay below the single-token branch (30/15/12) to avoid score
+  explosion. Stemmed equality fallback makes the match plural-tolerant
+  (`orders` -> `order`, `tasks` -> `task`) on both single and multi-token paths.
+- Capped indexed text per tool: description clipped at 1500 chars, combined
+  parameter descriptions at 800 chars. Long descriptions still add recall but
+  no longer dominate BM25 via raw term frequency.
+
+### Fixed
+
+- Removed the per-term `+1.0` description bonus: it rewarded long bodies for
+  generic tokens (`text`, `content`, `template`). Full-phrase `+20` match in
+  description is kept as the strong relevance signal.
+
 ## [1.0.5] - 2026-10-26
 
 ### Changed

@@ -29,7 +29,7 @@ from fastmcp import FastMCP
 # ---------------------------------------------------------------- config
 
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 USER_AGENT = f"mcp-search-proxy/{VERSION}"
 
 
@@ -125,6 +125,8 @@ DESC_CLIP = 500
 CHARS_PER_TOKEN = 4.0
 BM25_K1 = 1.5
 BM25_B = 0.75
+INDEX_DESC_CAP = 1500        # C (1.0.6): cap description chars indexed per tool (long-desc magnet cut)
+INDEX_PARAM_DESC_CAP = 800   # C (1.0.6): cap combined param-description chars indexed per tool
 TIER1_SHORT_DESC_LEN = 60
 TIER1_NOTE_LEN = 200       # upstream server-note clip (tier-1 level 1/2)
 TIER1_FALLBACK_LEN = 80    # medoid description clip (tier-1 level 3)
@@ -458,7 +460,9 @@ def _entry_search_text(tool: dict) -> str:
     src = _source_of(name).lower().replace("_", " ")
     if src and src not in norm_name:
         parts.append(src)
-    parts.append(desc)
+    # C (1.0.6): clip body before indexing — long descriptions (learn_shopify_api
+    # ~4k ch, mailchimp Args: blocks, Context7) otherwise dominate BM25 via TF.
+    parts.append(desc[:INDEX_DESC_CAP])
     try:
         props = (tool.get("inputSchema") or {}).get("properties") or {}
         if isinstance(props, dict):
@@ -472,7 +476,8 @@ def _entry_search_text(tool: dict) -> str:
                     if d:
                         descs.append(str(d))
             if descs:
-                parts.append(" ".join(descs))
+                # C (1.0.6): param descriptions capped — they add recall, not ranking mass.
+                parts.append(" ".join(descs)[:INDEX_PARAM_DESC_CAP])
     except Exception:
         pass
     return "\n".join(parts)
@@ -667,8 +672,10 @@ def _search_one(query: str, limit: int) -> list[str]:
                     continue
                 if term in n_lower:
                     keyword_boost += 3.0
-                if term in d_lower:
-                    keyword_boost += 1.0
+                # B (1.0.6): per-term +1.0 on description REMOVED — it rewarded
+                # long bodies (learn_shopify_api, mailchimp Args:, Context7)
+                # for generic tokens (text/content/template). Full-phrase +20
+                # above is kept: phrase match in desc stays a strong signal.
             # Adaptation to the provider-operation namespaced catalog
             # (original, single-token queries only): the literal
             # +50/+20 boost ties all contenders (e.g. 'mail' in gmail-* and
@@ -678,22 +685,44 @@ def _search_one(query: str, limit: int) -> list[str]:
             # (not a prefix of 'mailchimp'), 'search' is the exact operation
             # of WebSearchAndCrawl-search (not of search_analytics).
             qparts = re.findall(r"[a-z0-9_]+", qnorm)
+            op_lower = n.rsplit("-", 1)[-1].lower() if "-" in n else n.rsplit("_", 1)[-1].lower()
+            src_lower = _source_of(n).lower()
+            # Segment-match (Punto 1, 2026-10-26): the operation may be
+            # compound ('create_issue'); split on _ so 'issue' matches
+            # the exact segment. Same for compound sources ('wsc_mcp').
+            # Len>=3 guard: no boost on 1-2ch tokens.
+            op_segs = _segments(op_lower)
+            src_segs = _segments(src_lower)
+            # Stemmed copies for plural-tolerant match (orders->order,
+            # tasks->task): raw equality first, stemmed fallback.
+            op_stems = {_stem(w) for w in op_segs}
+            src_stems = {_stem(w) for w in src_segs}
             if len(qparts) == 1:
                 q1 = qparts[0]
-                op_lower = n.rsplit("-", 1)[-1].lower() if "-" in n else n.rsplit("_", 1)[-1].lower()
-                src_lower = _source_of(n).lower()
-                # Segment-match (Punto 1, 2026-10-26): the operation may be
-                # compound ('create_issue'); split on _ so 'issue' matches
-                # the exact segment. Same for compound sources ('wsc_mcp').
-                # Len>=3 guard: no boost on 1-2ch tokens.
-                op_segs = _segments(op_lower)
-                src_segs = _segments(src_lower)
-                if len(q1) >= 3 and (q1 == op_lower or q1 in op_segs):
+                q1s = _stem(q1)
+                if len(q1) >= 3 and (q1 == op_lower or q1 in op_segs or q1s in op_stems):
                     keyword_boost += 30.0
-                if len(q1) >= 3 and (q1 == src_lower or q1 in src_segs):
+                if len(q1) >= 3 and (q1 == src_lower or q1 in src_segs or q1s in src_stems):
                     keyword_boost += 15.0
                 elif len(q1) >= 4 and src_lower.endswith(q1) and q1 != src_lower:
                     keyword_boost += 12.0
+            else:
+                # A (1.0.6): multi-token provider/operation boost. Each query
+                # token matching the operation (+10) or the provider (+6,
+                # suffix +4) disambiguates the tail on multi-intent queries
+                # (send gmail email, list clickup tasks) where the old
+                # single-token branch never fired. Weights are lower than the
+                # single-token branch (30/15/12) to avoid score explosion.
+                for qp in set(qparts):
+                    if len(qp) < 3:
+                        continue
+                    qps = _stem(qp)
+                    if qp == op_lower or qp in op_segs or qps in op_stems:
+                        keyword_boost += 10.0
+                    if qp == src_lower or qp in src_segs or qps in src_stems:
+                        keyword_boost += 6.0
+                    elif len(qp) >= 4 and src_lower.endswith(qp) and qp != src_lower:
+                        keyword_boost += 4.0
         if s > 0 or bonus > 0:
             ranked.append((s + bonus + keyword_boost, n))
     ranked.sort(key=lambda x: (-x[0], x[1]))
