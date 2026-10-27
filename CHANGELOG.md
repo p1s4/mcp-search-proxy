@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.7] - 2026-10-27
+
+### Fixed
+
+- Fail-closed partial refresh: a refresh that would shrink a healthy cached
+  catalog while any configured upstream is missing or returns 0 tools is now
+  refused (`RuntimeError`, previous index + disk manifest kept). Fixes the
+  reboot race where the proxy started in the same second as its upstream and
+  the failed refresh overwrote a 631-tool catalog with the 28 tools of the
+  surviving upstream until a manual `mcp_refresh`. A genuine shrink is still
+  applied when ALL configured upstreams answer (even with fewer tools);
+  cold boot with an empty cache applies whatever answers.
+
 ## [1.0.6] - 2026-10-27
 
 ### Changed

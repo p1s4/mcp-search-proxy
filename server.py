@@ -29,7 +29,7 @@ from fastmcp import FastMCP
 # ---------------------------------------------------------------- config
 
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 USER_AGENT = f"mcp-search-proxy/{VERSION}"
 
 
@@ -797,8 +797,16 @@ def refresh_catalog(force: bool = False) -> dict:
     delegating to _mcp_server.instructions), so it is runtime-mutable.
     Note: clients read instructions at the initialize handshake — a
     runtime mcp_refresh() updates the server but already-connected clients
-    keep seeing the old text until their next handshake."""
+    keep seeing the old text until their next handshake.
+    1.0.7 fail-closed: a partial refresh (some upstream down/empty) that
+    would shrink a good catalog is refused — the previous index + manifest
+    are kept and RuntimeError is raised (lifespan/mcp_refresh fall back
+    to disk/in-memory). A genuine shrink is applied only when ALL
+    configured upstreams answer (even with fewer tools)."""
     global _LAST_REFRESH
+    with _LOCK:
+        _prev_n = _N
+        _prev_fp = _FINGERPRINT
     per_up = _tools_list_live()  # [(url, tools)] fan-out
     merged: list[dict] = []
     routing: dict[str, str] = {}
@@ -815,6 +823,15 @@ def refresh_catalog(force: bool = False) -> dict:
             merged.append(t)
     if not merged:
         raise RuntimeError("all upstreams returned 0 tools")
+    # Fail-closed on partial upstream failure (reboot race: e.g. litellm
+    # still down, only a11y answers -> 28 < 631 cached). Generic: compare
+    # against the previous in-memory catalog, refuse shrinkage when any
+    # configured upstream is missing or returned 0 tools.
+    ok_urls = {url for url, tools in per_up if tools}
+    missing = [u for u in UPSTREAM_URLS if u not in ok_urls]
+    if missing and _prev_n and len(merged) < _prev_n:
+        _log(f"WARNING: partial refresh refused ({len(merged)} < {_prev_n} cached, missing {missing}): keeping fp={_prev_fp}")
+        raise RuntimeError(f"partial refresh refused: {len(merged)} < {_prev_n} cached, missing upstreams {missing}")
     _build_index(merged, routing)
     with _LOCK:
         _LAST_REFRESH = time.time()
