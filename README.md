@@ -61,7 +61,7 @@ Security decisions belong **upstream**, before the proxy:
 
 ## How it works
 
-1. **Startup**: `tools/list` fan-out over all `UPSTREAM_URLS` → merge → in-memory BM25 index + on-disk manifest (`MANIFEST_PATH`, survives restarts). Collision policy is fail-closed: first upstream wins, duplicates logged and dropped.
+1. **Startup**: `tools/list` fan-out over all `UPSTREAM_URLS` → merge → in-memory BM25 index + on-disk manifest (`MANIFEST_PATH`, survives restarts). Collision policy is fail-closed: first upstream wins, duplicates logged and dropped. Refresh is fail-closed too: a refresh that would shrink a healthy cached catalog while any configured upstream is missing/empty is refused (previous index + manifest kept, `RuntimeError`); a genuine shrink applies only when ALL upstreams answer.
 2. **Search** (`mcp_search`): BM25 (`k1=1.5`, `b=0.75`) over `name + source label + description + top-level param names`. Admission via rarest-token gate (OOV-robust: only in-vocabulary tokens pick the gate), exact-name match short-circuits. A `NAME_BONUS` (1.0 × idf per query-token found in the tool name) compensates lexical body mismatch; a guarded substring match (`query → name`, length ≥ 4) covers cases like `mail` in `gmail` without a stemmer dictionary. A manual English stemmer (`ing/ed/ies/s…`, zero dependencies) runs on both docs and queries.
 3. **Describe** (`mcp_describe`, ≤10 names/call): full `inputSchema` for named tools only. If you already see the exact name (tier-1 listing, previous search), skip search and come here directly.
 4. **Call** (`mcp_call`): validates `required` params locally (fail-open on `$ref`/malformed schemas), then routes `tools/call` to the upstream that served the tool (`_TOOL_UPSTREAM`). Unknown-tool triggers a one-shot re-list + retry before failing.
@@ -73,7 +73,7 @@ Multi-upstream specifics:
 - **Stateless upstreams**: if `initialize` returns 200 without a `Mcp-Session-Id` header, the upstream is marked stateless and served with `session=None` (no `Mcp-Session-Id` header on list/call). No session reset/retry on 400 for these — a 400 is a normal error. Stateful behaviour is unchanged where the server returns a session id.
 - **Per-upstream auth**: `UPSTREAM_TOKENS` is positional against `UPSTREAM_URLS` (empty entry = no auth). Fallback: `LITELLM_MASTER_KEY` applies only to URLs containing `litellm`, nothing elsewhere.
 - **Per-upstream timeout**: `UPSTREAM_TIMEOUT_A11Y` (default 280s) applies to URLs containing `a11y`; everything else uses the call default. Raise it for browser/crawl servers behind slow reverse proxies.
-- **Fail-soft fetch, fail-closed merge**: one upstream down → skipped with a log line, the rest still serve. All down → `mcp_refresh` returns an error and the cached catalog stays.
+- **Fail-soft fetch, fail-closed refresh/merge**: one upstream down → skipped with a log line, but if the survivors are fewer than the cached catalog the refresh is refused (`RuntimeError`, cached index + manifest kept). All down → `mcp_refresh` returns an error and the cached catalog stays. A shrink applies only when ALL configured upstreams answer.
 
 Names are `mcp_*` (not `tool_*`) because `tool_search` is a server-side reserved name on xAI (HTTP 400) — new names avoid the problem at the root.
 
@@ -168,7 +168,7 @@ Setup: Docker on ARM64, Python 3.12, FastMCP 4.0.3, 2 upstreams (MCP aggregator 
 
 **Stateful E2E** (the reason for per-upstream sticky sessions): `browser_navigate https://example.com/` → `scan_page {wcag2a,wcag2aa,wcag21aa,wcag22aa}` on the **same** page → `Violations: 0, Incomplete: 2, Passes: 28` → `browser_snapshot` returns the **same** URL/title, no `No open pages`. Navigate → scan → snapshot share one session through the proxy.
 
-**Refresh**: `mcp_refresh` returns same fingerprint when upstreams are unchanged; `mcp_describe` cross-upstream returns `not_found=[]`; unknown-tool triggers one re-list + retry.
+**Refresh**: `mcp_refresh` returns same fingerprint when upstreams are unchanged; a partial refresh with a missing/empty upstream is refused (same fp kept, `RuntimeError`), not overwritten; `mcp_describe` cross-upstream returns `not_found=[]`; unknown-tool triggers one re-list + retry.
 
 ## Limitations (honest)
 
