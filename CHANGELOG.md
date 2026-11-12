@@ -5,6 +5,77 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-11-12
+
+### Added
+
+- **Obligations layer** (`Mandatory obligations by server`): a second,
+  deterministic section of the MCP `instructions`, published below the tier-1
+  catalog. Imperative rules stated by each upstream server in its own
+  `instructions` (`MUST`, `IMPORTANT`, `REQUIRED`, `NEVER`, `ALWAYS`, `DO NOT`,
+  plus `do not`, `before calling|building`, `start with`, `call X first`,
+  `never invent`, `only use`, `use only when`, `run \``) are extracted
+  **verbatim** — no LLM, no cache, no paraphrase — and emitted per source.
+  Same input → same output, byte-stable across calls (prompt-cache safe).
+- Fixed rule for skill guides: if a source exposes a `*get_skill_guide` tool
+  and its notes mention skills, the obligation `MUST call <tool>() first` is
+  emitted mechanically, with the tool name taken from the catalog so it cannot
+  drift.
+- `OBLIGATION_BUDGET` 400 chars per source, stop at the first sentence that
+  would overflow (a rule is never cut in half). De-duplication against the
+  purpose line via normalised 60-char prefix, so a truncated (`…`) purpose
+  still suppresses the duplicate.
+
+### Fixed
+
+- **Regression from 1.1.0**: the generated semantic note replaced the upstream
+  `[source]` block wholesale, so 10 of 11 upstream obligation blocks were
+  being silently dropped (e.g. Home Assistant's `MUST read the skill guide
+  first`). Purpose and obligations are now two additive layers: a `PURPOSES`
+  pin can no longer erase a server's `MUST`/`NEVER`.
+- Marker matching is word-boundary and case-insensitive, so `never` inside
+  `whenever`/`whatever` no longer admits half sentences.
+- Numbered/bulleted list prefixes (`2.`, `-`, `*`) are stripped before the
+  length check, so rules written as list items are no longer discarded.
+- Length floor lowered to 12 chars for all-uppercase rules: short but real
+  rules (`Never invent IDs.`) are kept.
+- `use only when|if|for|after` added to the imperative forms — catches credit
+  and quota limits phrased that way.
+- Quoted tool names (`Always call 'get_me' first`) are recognised.
+
+## [1.1.0] - 2026-11-12
+
+### Added
+
+- **Semantic notes per server** (optional): at refresh, the proxy asks an
+  OpenAI-compatible endpoint (e.g. LiteLLM) for one English purpose sentence
+  per source, passing one MCP at a time. Notes are cached in
+  `data/purposes.json` keyed by a hash of the server's tool surface, so steady
+  state costs **zero** LLM calls; only a changed surface is regenerated.
+  Enrichment runs on a daemon thread **after** catalog, manifest and
+  instructions are published — the handshake never waits for an LLM.
+  Controlled by `ENRICH_BASE_URL`, `ENRICH_MODEL`, `ENRICH_API_KEY`,
+  `ENRICH_TIMEOUT`, `ENRICH_CONCURRENCY`. Off when base URL or model is empty
+  (behaviour identical to 1.0.7).
+- `PURPOSES` env: manual purpose pins (`source=text;source2=text`) that win
+  over generated notes. Intended for exceptions that must not drift.
+- **Groups** (optional): `GROUPS=name=pattern[,pattern];name2=...`, matched
+  with `fnmatch` against both the tool name and the source prefix, so
+  membership follows the upstreams automatically. `mcp_search` and
+  `mcp_describe` accept an optional `group` parameter and are fail-closed: an
+  unknown group, or a name outside the group, is never silently widened to the
+  whole catalog.
+- Purpose priority chain: `PURPOSES` pin → generated note → upstream
+  `[source]` block → medoid description.
+- Generated notes are treated as untrusted input: single line, no markdown, no
+  URLs, max 40 words / 240 chars; a response breaking the shape is discarded
+  and the previous note is kept.
+
+### Changed
+
+- Source rows in `instructions` are no longer described by the medoid tool of
+  an arbitrary server member when a real note is available.
+
 ## [1.0.7] - 2026-10-27
 
 ### Fixed

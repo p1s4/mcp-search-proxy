@@ -32,6 +32,7 @@ Thumbs.db
 .env.*
 !.env.example
 
-# Runtime data (persisted catalog, local only)
+# Runtime data (persisted catalog + generated notes, local only)
 data/manifest.json
+data/purposes.json
 data/*.tmp

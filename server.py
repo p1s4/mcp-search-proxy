@@ -12,6 +12,7 @@ BM25: k1=1.5 b=0.75, rarest-token admission, exact-name=inf (like Hermes catalog
 POC: lowercase-split tokenize (no Snowball/nltk to stay at zero extra dependencies).
 """
 
+import fnmatch
 import hashlib
 import json
 import math
@@ -22,6 +23,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 
 from fastmcp import FastMCP
@@ -29,7 +31,7 @@ from fastmcp import FastMCP
 # ---------------------------------------------------------------- config
 
 
-VERSION = "1.0.7"
+VERSION = "1.1.1"
 USER_AGENT = f"mcp-search-proxy/{VERSION}"
 
 
@@ -131,6 +133,62 @@ TIER1_SHORT_DESC_LEN = 60
 TIER1_NOTE_LEN = 200       # upstream server-note clip (tier-1 level 1/2)
 TIER1_FALLBACK_LEN = 80    # medoid description clip (tier-1 level 3)
 TIER1_TRY_KW = 5           # try-keywords per row, extracted from tool names
+
+# ---------------------------------------------------------------- obligations layer (1.1.0)
+# Upstream [source] blocks carry OPERATIONAL rules ('MUST', 'NEVER', 'start with',
+# 'before building... confirm') that a generated purpose note cannot paraphrase
+# without losing them. They are extracted VERBATIM and deterministic -- no model
+# in the loop, no summarisation -- and emitted in a separate block, so the purpose
+# layer ADDS to them instead of replacing them.
+OBLIGATION_BUDGET = 400        # chars per source (all extracted rules, joined)
+OBLIGATION_DUP_PREFIX = 60     # chars compared against the purpose note for de-duplication
+OBLIGATION_MIN_LEN = 25        # shorter fragments are noise ('Never invent IDs.' is 18)
+OBLIGATION_MIN_LEN_UC = 12     # ...but an all-caps rule is short AND load-bearing
+# Word-boundary matched, so 'never' inside 'whenever'/'whatever' is NOT a rule
+# (that was the bug the earlier substring test caused). Case-insensitive on
+# purpose: upstreams write 'Always call get_me first' as often as 'ALWAYS'.
+_OBL_UPPER_RE = re.compile(r"\b(MUST|IMPORTANT|REQUIRED|NEVER|ALWAYS|DO NOT)\b", re.I)
+# Case-insensitive phrasing markers, all imperative-shaped by construction.
+# Optional quotes/backticks around tool names: "call 'get_me' first".
+_OBL_PHRASE_RE = re.compile(
+    r"(do not |don't |before (calling|using|proceeding|building|answering) "
+    r"|call ['`]?\w+['`]? first|check ['`]?\w+['`]? first|start with|never invent|user approval"
+    r"|only use|use only (when|if|for|after)|as a fallback|run `)", re.I)
+_OBL_GUIDE_RE = re.compile(r"get_skill_guide|SKILL\.md|skill://", re.I)
+_OBL_DROP_RE = re.compile(r"^(\[|- |#)")
+_OBL_NUM_RE = re.compile(r"^\s*(?:\d+\.|[-*])\s+")
+_OBL_TAIL_RE = re.compile(r"\s+##+\s*[A-Z][\w ]*$")
+
+# ---------------------------------------------------------------- groups + enrichment (1.1.0)
+
+# GROUPS="workspace=Google_Workspace*,file_bridge;audit=audit*,scan*,browser*;dev=github,Context7"
+# A member is fnmatch-ed against BOTH the tool name and its source prefix, so
+# membership follows the upstream automatically: adding or removing an MCP
+# upstream needs no config change unless that source belongs to a group.
+GROUPS_RAW = os.environ.get("GROUPS", "").strip()
+# PURPOSES="wsc_mcp=Web search + crawl of any URL. Prefer this over curl..."
+# Manual pin, same "name=value;name=value" syntax. Wins over the generated
+# note: reserve it for exceptions that must not drift, not for routine texts.
+PURPOSES_RAW = os.environ.get("PURPOSES", "").strip()
+
+# Semantic note enrichment (optional): any OpenAI-compatible endpoint.
+# ENRICH_BASE_URL must include the API version, e.g. http://litellm:4000/v1
+ENRICH_BASE_URL = os.environ.get("ENRICH_BASE_URL", "").strip().rstrip("/")
+ENRICH_MODEL = os.environ.get("ENRICH_MODEL", "").strip()
+ENRICH_API_KEY = os.environ.get("ENRICH_API_KEY", "").strip() or MASTER_KEY
+try:
+    ENRICH_TIMEOUT = max(5, int(os.environ.get("ENRICH_TIMEOUT", "60") or 60))
+except ValueError:
+    ENRICH_TIMEOUT = 60
+try:
+    ENRICH_CONCURRENCY = max(1, min(16, int(os.environ.get("ENRICH_CONCURRENCY", "4") or 4)))
+except ValueError:
+    ENRICH_CONCURRENCY = 4
+ENRICH_MAX_WORDS = 40       # requested in the prompt + enforced on the reply
+ENRICH_MAX_CHARS = 240      # hard clip of the accepted note
+ENRICH_DESC_CLIP = 300      # chars of each tool description sent in the payload
+ENRICH_ENABLED = bool(ENRICH_BASE_URL and ENRICH_MODEL)
+PURPOSES_PATH = os.path.join(os.path.dirname(MANIFEST_PATH) or ".", "purposes.json")
 # Documented deviation from Hermes (which is pure BM25 over search-text): some
 # catalog descriptions are in Italian (e.g. gmail-*), while model queries are
 # in English. Without name weighting, a doc repeating 'email/send' in the body
@@ -156,6 +214,12 @@ _SESSIONS: dict[str, str] = {}       # sticky per-upstream: url -> sid (never mi
 _STATELESS: set[str] = set()          # upstreams without sid (initialize 200 without Mcp-Session-Id): session=None
 _TOOL_UPSTREAM: dict[str, str] = {}  # routing: tool-name -> upstream url
 _UPSTREAM_INSTRUCTIONS: dict[str, str] = {}  # upstream url -> initialize instructions (server notes)
+_GROUPS: dict[str, list[str]] = {}      # group -> membership patterns (fnmatch, 1.1.0)
+_PURPOSES: dict[str, str] = {}          # source -> manual pin (env PURPOSES)
+_ENRICHED: dict[str, dict] = {}         # source -> generated note record (purposes.json)
+_ENRICH_THREAD: threading.Thread | None = None
+_ENRICH_RUNNING = False
+_ENRICH_STATE: dict = {"last_run": 0.0, "generated": 0, "reused": 0, "failed": 0, "skipped": 0}
 
 
 def _fingerprint(tools: list[dict]) -> str:
@@ -481,6 +545,398 @@ def _entry_search_text(tool: dict) -> str:
     except Exception:
         pass
     return "\n".join(parts)
+
+
+def _parse_pairs(raw: str) -> dict[str, str]:
+    """Parse 'k=v;k=v' (GROUPS / PURPOSES). Semicolon-separated entries split on
+    the FIRST '=' so values may contain '=' (URLs, query strings). Empty values
+    are dropped: a member list needs at least one pattern, a purpose one word."""
+    out: dict[str, str] = {}
+    for entry in (raw or "").split(";"):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        k, v = entry.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if k and v:
+            out[k] = v
+    return out
+
+
+def _parse_groups(raw: str) -> dict[str, list[str]]:
+    """GROUPS -> {group: [fnmatch patterns]}. Comma-separated inside a group.
+    Matching runs against the tool name AND its source prefix, so
+    'workspace=Google_Workspace*,file_bridge' catches the whole Google
+    Workspace source and the single file_bridge tool by source."""
+    out: dict[str, list[str]] = {}
+    for name, pats in _parse_pairs(raw).items():
+        items = [p.strip() for p in pats.split(",") if p.strip()]
+        if items:
+            out[name.lower()] = items
+    return out
+
+
+def _group_of(tool_name: str) -> list[str]:
+    """Groups a tool belongs to (a tool may be in several, or none)."""
+    with _LOCK:
+        groups = dict(_GROUPS)
+    if not groups:
+        return []
+    src = _source_of(tool_name)
+    hits: list[str] = []
+    for g, pats in groups.items():
+        for p in pats:
+            if fnmatch.fnmatchcase(tool_name, p) or fnmatch.fnmatchcase(src, p):
+                hits.append(g)
+                break
+    return hits
+
+
+def _in_group(tool_name: str, group: str) -> bool:
+    return group.lower() in _group_of(tool_name)
+
+
+def _group_names(group: str) -> list[str]:
+    """All tool names in a group (sorted, byte-stable)."""
+    with _LOCK:
+        names = list(_BY_NAME.keys())
+    return sorted(n for n in names if _in_group(n, group))
+
+
+def _source_hash(tools: list[dict]) -> str:
+    """Stable digest of a source's tool surface (names + clipped descriptions).
+    Captures 'a tool was added/removed' and 'a description changed', which is
+    exactly the trigger for regenerating that source's semantic note.
+    Sorted, so upstream ordering never invalidates the cache."""
+    items = []
+    for t in sorted(tools, key=lambda x: str(x.get("name", ""))):
+        desc = " ".join(str(t.get("description", "") or "").split())[:ENRICH_DESC_CLIP]
+        items.append(f"{t.get('name', '')}\u241f{desc}")
+    return hashlib.sha256("\n".join(items).encode()).hexdigest()[:16]
+
+
+def _sanitize_note(text: str) -> str:
+    """Notes are derived from third-party tool descriptions and end up in the
+    system prompt, so the model output is untrusted input: one line, no
+    markdown, no URLs, bounded length. '' means 'reject, keep the previous'."""
+    t = " ".join(str(text or "").split())
+    if not t:
+        return ""
+    t = t.strip("`'\"*_#- ")
+    t = re.sub(r"^[A-Za-z ]{0,20}:\s*", "", t) if re.match(r"^(note|purpose|description|summary)\s*:", t, re.I) else t
+    if "http://" in t or "https://" in t or "www." in t:
+        return ""
+    words = t.split()
+    if len(words) > ENRICH_MAX_WORDS:
+        t = " ".join(words[:ENRICH_MAX_WORDS])
+    if len(t) > ENRICH_MAX_CHARS:
+        cut = t[:ENRICH_MAX_CHARS].rsplit(" ", 1)[0] or t[:ENRICH_MAX_CHARS]
+        t = cut.rstrip(",;:") + "\u2026"
+    return t if len(t) >= 15 else ""
+
+
+def _call_llm(payload: str, model: str) -> str:
+    """One OpenAI-compatible /chat/completions call. stdlib only (urllib), no
+    dependency added. Raises on HTTP/parse failure: the caller degrades."""
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": (
+                "You write one-line purpose notes for MCP tool servers. "
+                "Reply with ONLY the note: max 40 words, English, one line, "
+                "no markdown, no quotes, no URLs. Be concrete about what the "
+                "server can do and when a model should use it.")},
+            {"role": "user", "content": payload},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 140,
+    }
+    req = urllib.request.Request(
+        f"{ENRICH_BASE_URL}/chat/completions",
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    if ENRICH_API_KEY:
+        req.add_header("Authorization", f"Bearer {ENRICH_API_KEY}")
+    with urllib.request.urlopen(req, timeout=ENRICH_TIMEOUT) as r:
+        out = json.load(r)
+    choices = out.get("choices") or []
+    if not choices:
+        raise RuntimeError("no choices in completion response")
+    msg = choices[0].get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, list):  # some providers return content parts
+        content = " ".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+    return str(content or "")
+
+
+def _enrich_one(source: str, tools: list[dict], model: str) -> dict | None:
+    """Generate the note for ONE source. Returns the record or None on failure."""
+    lines = []
+    for t in sorted(tools, key=lambda x: str(x.get("name", ""))):
+        desc = " ".join(str(t.get("description", "") or "").split())[:ENRICH_DESC_CLIP]
+        lines.append(f"{t.get('name', '')} :: {desc}" if desc else str(t.get("name", "")))
+    payload = (f"Server name: {source}\nTools ({len(tools)}):\n" + "\n".join(lines)
+               + "\n\nWrite the purpose note for this server.")
+    try:
+        note = _sanitize_note(_call_llm(payload, model))
+    except Exception as e:
+        _log(f"enrich {source} failed: {e}")
+        return None
+    if not note:
+        _log(f"enrich {source}: empty/invalid note, keeping previous")
+        return None
+    return {
+        "tools": len(tools),
+        "hash": _source_hash(tools),
+        "note": note,
+        "model": model,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def _load_purposes() -> None:
+    """Load data/purposes.json (generated cache) into memory."""
+    try:
+        with open(PURPOSES_PATH) as f:
+            payload = json.load(f)
+        entries = payload.get("sources") or payload or {}
+        if not isinstance(entries, dict):
+            return
+        clean = {k: v for k, v in entries.items()
+                 if isinstance(v, dict) and isinstance(v.get("note"), str) and v.get("note").strip()}
+        with _LOCK:
+            _ENRICHED.clear()
+            _ENRICHED.update(clean)
+        _log(f"purposes from disk: {len(clean)} source notes ({os.path.basename(PURPOSES_PATH)})")
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        _log(f"load purposes failed: {e}")
+
+
+def _save_purposes() -> None:
+    """Atomic write of purposes.json (same dir as manifest.json, gitignored:
+    it is generated data, not source)."""
+    try:
+        os.makedirs(os.path.dirname(PURPOSES_PATH) or ".", exist_ok=True)
+        with _LOCK:
+            sources = dict(_ENRICHED)
+        payload = {
+            "version": VERSION,
+            "model": ENRICH_MODEL,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "sources": sources,
+        }
+        tmp = PURPOSES_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+        os.replace(tmp, PURPOSES_PATH)
+    except Exception as e:
+        _log(f"save purposes failed: {e}")
+
+
+def enrich_catalog() -> dict:
+    """Regenerate semantic notes for the sources whose hash changed.
+    Steady state cost is ZERO model calls: unchanged source -> reuse the cached
+    note. Runs synchronously here; refresh_catalog() calls it on a daemon
+    thread so tools/list never waits on an LLM. Fail-soft at every level:
+    a failed source keeps its previous note and falls back to the medoid."""
+    global _ENRICH_RUNNING
+    if not ENRICH_ENABLED:
+        return {"enabled": False}
+    model = ENRICH_MODEL
+    with _LOCK:
+        names = list(_BY_NAME.keys())
+        cached = dict(_ENRICHED)
+        pins = dict(_PURPOSES)
+        _ENRICH_RUNNING = True
+    by_source: dict[str, list[dict]] = {}
+    for n in names:
+        src = _source_of(n)
+        if src in pins:  # manual pin wins: no model call, no cache entry needed
+            continue
+        by_source.setdefault(src, []).append(_BY_NAME[n])
+    # Sources whose tier-1 row is split per service (Google_Workspace:
+    # gmail/drive/calendar/...) use a per-service medoid, which is more precise
+    # than one source-wide sentence: generating a note they would never use
+    # would only burn tokens.
+    skipped_split = 0
+    for src in list(by_source):
+        try:
+            if _tier1_needs_split(src):
+                by_source.pop(src, None)
+                skipped_split += 1
+        except Exception:
+            pass
+    todo = [s for s, ts in by_source.items()
+            if cached.get(s, {}).get("hash") != _source_hash(ts)]
+    reused = len(by_source) - len(todo)
+    generated = failed = 0
+    try:
+        if todo:
+            _log(f"enrich: {len(todo)} source to generate, {reused} reused "
+                 f"({len(pins)} pinned), model={model} conc={ENRICH_CONCURRENCY}")
+            with ThreadPoolExecutor(max_workers=ENRICH_CONCURRENCY) as ex:
+                futures = {ex.submit(_enrich_one, s, by_source[s], model): s for s in todo}
+                for fut in as_completed(futures):
+                    s = futures[fut]
+                    try:
+                        rec = fut.result()
+                    except Exception as e:
+                        _log(f"enrich {s} raised: {e}")
+                        rec = None
+                    if rec:
+                        with _LOCK:
+                            _ENRICHED[s] = rec
+                        generated += 1
+                    else:
+                        failed += 1
+            if generated:
+                _save_purposes()
+    finally:
+        with _LOCK:
+            _ENRICH_RUNNING = False
+            _ENRICH_STATE.update({"last_run": time.time(), "generated": generated,
+                                  "reused": reused, "failed": failed,
+                                  "skipped": len(pins) + skipped_split})
+    if todo:
+        _log(f"enrich done: {generated} generated, {failed} failed, {reused} reused")
+    return {"enabled": True, "generated": generated, "failed": failed,
+            "reused": reused, "pinned": len(pins), "split_skipped": skipped_split,
+            "model": model}
+
+
+def _enrich_async() -> None:
+    """Fire-and-forget regeneration: runs AFTER the catalog + manifest are
+    already published, so the handshake and tools/list never block on an LLM.
+    Only ONE background run at a time (a stale refresh cannot stack threads)."""
+    global _ENRICH_THREAD
+    if not ENRICH_ENABLED:
+        return
+    with _LOCK:
+        if _ENRICH_RUNNING or (_ENRICH_THREAD is not None and _ENRICH_THREAD.is_alive()):
+            _log("enrich: previous run still active, skipping this refresh")
+            return
+
+    def _run() -> None:
+        try:
+            enrich_catalog()
+            _update_instructions()  # pick up the new notes for the NEXT handshake
+        except Exception as e:
+            _log(f"enrich background run failed (notes unchanged): {e}")
+
+    t = threading.Thread(target=_run, name="enrich", daemon=True)
+    with _LOCK:
+        _ENRICH_THREAD = t
+    t.start()
+
+
+def _obligations(sentences: list[str], budget: int = OBLIGATION_BUDGET) -> str:
+    """Concatenate the sentences that state an operational rule, verbatim.
+    Deterministic and idempotent: same upstream text -> same string, so it is
+    never cached and never sent to a model."""
+    out: list[str] = []
+    total = 0
+    for s in sentences:
+        s = _OBL_TAIL_RE.sub("", s).strip(" -|")
+        if not s or _OBL_DROP_RE.match(s):
+            continue
+        if not (_OBL_UPPER_RE.search(s) or _OBL_PHRASE_RE.search(s)):
+            continue
+        floor = OBLIGATION_MIN_LEN_UC if _OBL_UPPER_RE.search(s) else OBLIGATION_MIN_LEN
+        if len(s) < floor:
+            continue
+        if total + len(s) + 1 > budget:
+            break
+        out.append(s)
+        total += len(s) + 1
+    return " ".join(out)
+
+
+def _obligation_sentences(text: str) -> list[str]:
+    """Split an upstream note into sentence-ish units for _obligations().
+    Line breaks count as boundaries (many upstreams use one rule per line) and
+    numbered/bulleted list markers are stripped so a rule does not arrive as
+    '2. Always call get_me first'."""
+    body = re.sub(r"\s*---\s*$", "", (text or "").strip())
+    body = body.replace("**", "").replace("\t", " ")
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z`])|\n(?=[A-Z`0-9])", body)
+    out: list[str] = []
+    for p in parts:
+        p = _OBL_NUM_RE.sub("", p).strip()
+        if p:
+            out.append(" ".join(p.split()))
+    return out
+
+
+def _skill_guide_tool(source: str) -> str:
+    """Tool a source must call first to load its skill, or ''.
+    Rule is fixed (not derived from prose): if a source ships a tool whose name
+    ends in 'get_skill_guide' and its notes mention skills, the obligation is
+    emitted mechanically even when the upstream wording drifts."""
+    with _LOCK:
+        names = sorted(n for n in _BY_NAME
+                       if _source_of(n) == source and n.endswith("get_skill_guide"))
+    return names[0] if names else ""
+
+
+def _source_obligations(source: str, notes: dict[str, str]) -> str:
+    """Layer B for one source: the fixed skill-guide rule plus the verbatim
+    rules mined from the upstream [source] block. '' when the source states no
+    obligation (most servers) -- then the row is purpose-only, as before."""
+    body = notes.get(source, "") or ""
+    parts: list[str] = []
+    guide = _skill_guide_tool(source)
+    if guide and _OBL_GUIDE_RE.search(body):
+        parts.append(f"MUST call {guide}() first: it returns the reference files "
+                     "to read before acting.")
+    mined = _obligations(_obligation_sentences(body))
+    if mined:
+        parts.append(mined)
+    return " ".join(parts)
+
+
+def _trim_duplicate(obligation: str, note: str) -> str:
+    """Drop obligation sentences already carried by the purpose note, so the
+    two layers add up instead of repeating each other (a pin such as
+    wsc_mcp='... prefer this over curl' already states its rule).
+
+    Matched on a normalised PREFIX, not on the whole sentence: when a source has
+    no generated note the purpose falls back to the upstream text clipped at
+    TIER1_NOTE_LEN, so an echoed rule arrives truncated and an exact-equality
+    test would miss it and print the same rule twice."""
+    if not obligation or not note:
+        return obligation
+    flat = " ".join(note.split()).lower()
+    kept: list[str] = []
+    for s in _obligation_sentences(obligation):
+        norm = " ".join(s.split()).lower()
+        head = norm[:OBLIGATION_DUP_PREFIX]
+        if head and head in flat:
+            continue
+        kept.append(s)
+    return " ".join(kept)
+
+
+def _source_note(source: str) -> str:
+    """Tier-1 note for a source, in priority order:
+    1) PURPOSES manual pin (env)          -> wins always, zero drift
+    2) purposes.json generated note       -> automatic, hash-cached
+    3) upstream [source] instructions     -> handled by the caller (_tier1_notes)
+    4) medoid tool description            -> handled by the caller
+    Returns '' when the caller must fall through to 3/4.
+
+    This is the PURPOSE layer only. Operational rules live in a separate,
+    additive layer (_source_obligations / _obligations_block) and are never
+    replaced by the note returned here."""
+    with _LOCK:
+        pin = _PURPOSES.get(source, "")
+        if pin:
+            return pin
+        rec = _ENRICHED.get(source) or {}
+    return str(rec.get("note", "") or "")
 
 
 def _tokenize(text: str) -> list[str]:
@@ -838,6 +1294,10 @@ def refresh_catalog(force: bool = False) -> dict:
     _refresh_upstream_instructions()
     _save_manifest()
     _update_instructions()
+    # 1.1.0: semantic notes are a background concern. The catalog, the manifest
+    # and the instructions are already published here, so neither tools/list
+    # nor the handshake ever waits on an LLM; unchanged sources cost 0 calls.
+    _enrich_async()
     total_chars = len(json.dumps(_TOOLS))
     _log(f"catalog refresh: {_N} tool {counts}, {total_chars}ch (~{_estimate_tokens(total_chars)}tok), fp={_FINGERPRINT}")
     return {
@@ -1043,7 +1503,18 @@ def _tier1_listing() -> str:
                 phrase = _word_clip(bdesc, TIER1_FALLBACK_LEN)
                 rows[f"{s}-{svc}"] = f"- {s} ({svc}): {phrase}{stry} ({len(snames)} tool)"
             continue
-        if s in notes:
+        # 1.1.0 priority (agreed): manual pin (PURPOSES) -> generated note
+        # (purposes.json) -> upstream [source] instructions -> medoid description.
+        # The generated note outranks upstream text because upstream text is
+        # often a generic one-liner ('The GitHub MCP Server provides tools to
+        # interact with GitHub platform'), while any source that must not drift
+        # gets a PURPOSES pin and wins over both.
+        # The PURPOSE only replaces the descriptive sentence: obligations are
+        # a separate layer (_obligations_block) and are never dropped.
+        gen = _source_note(s)
+        if gen:
+            phrase = _word_clip(gen, TIER1_NOTE_LEN)
+        elif s in notes:
             phrase = _word_clip(notes[s], TIER1_NOTE_LEN)
         else:
             if kws:
@@ -1061,18 +1532,60 @@ def _tier1_listing() -> str:
     return "\n".join(rows[k] for k in sorted(rows))
 
 
+def _obligations_block(notes: dict[str, str] | None = None) -> str:
+    """Layer B listing, one '- source: rules' line per source that has any.
+    Sorted byte-stable like the catalog, so it stays prompt-cache friendly."""
+    notes = _tier1_notes() if notes is None else notes
+    with _LOCK:
+        sources = sorted({_source_of(n) for n in _BY_NAME})
+    rows: list[str] = []
+    for s in sources:
+        # De-duplicate against the phrase the catalog row ACTUALLY shows, which
+        # is pin -> generated note -> upstream (see _tier1_listing). Comparing
+        # against the pin alone would re-print rules already carried by the
+        # upstream text when a source has no generated note.
+        shown = _word_clip(_source_note(s) or notes.get(s, "") or "", TIER1_NOTE_LEN)
+        ob = _trim_duplicate(_source_obligations(s, notes), shown)
+        if ob:
+            rows.append(f"- {s}: {ob}")
+    return "\n".join(rows)
+
+
 def _update_instructions() -> None:
     try:
         listing = _tier1_listing()
         with _LOCK:
             n = _N
+            groups = dict(_GROUPS)
+        group_line = ""
+        if groups:
+            parts = []
+            for g in sorted(groups):
+                cnt = len(_group_names(g))
+                parts.append(f"{g} ({cnt})")
+            group_line = (
+                "\nGroups (optional `group` param on mcp_search/mcp_describe "
+                "restricts results to one of these): " + ", ".join(parts) + "."
+            )
         mcp.instructions = (
             f"Search-first proxy in front of {len(UPSTREAM_URLS)} MCP upstreams ({n} tools). "
             "Flow: mcp_search to find names, mcp_describe for full schemas, "
             "mcp_call to execute. mcp_refresh only when a tool comes back unknown or stale — never refresh before every call. "
-            "Never tell the user a capability is unavailable without searching first.\n"
+            "Never tell the user a capability is unavailable without searching first. "
+            "When the tool name and its required params are already obvious from this catalog, "
+            "call mcp_call directly: mcp_describe is only needed for the full schema."
+            f"{group_line}\n"
             f"Catalog by server:\n{listing}"
         )
+        # Layer B: operational rules, additive to the catalog above. Kept in its
+        # own section so a generic purpose line cannot shadow a MUST/NEVER.
+        obligations = _obligations_block()
+        if obligations:
+            mcp.instructions += (
+                "\n\nMandatory obligations by server (stated by the server itself; "
+                "obey them in addition to the purpose above, and read any skill "
+                "guide they point to BEFORE calling tools):\n" + obligations
+            )
     except Exception as e:
         _log(f"update instructions failed: {e}")
 
@@ -1098,11 +1611,35 @@ def _ensure_catalog() -> None:
             _log(f"TTL refresh failed, using in-memory catalog: {e}")
 
 
+def _init_config() -> None:
+    """Apply GROUPS/PURPOSES env once, before the catalog is built.
+    Both are optional: without them the proxy behaves like 1.0.7 (no groups,
+    tier-1 notes from upstream instructions or medoid)."""
+    groups = _parse_groups(GROUPS_RAW)
+    pins = _parse_pairs(PURPOSES_RAW)
+    with _LOCK:
+        _GROUPS.clear()
+        _GROUPS.update(groups)
+        _PURPOSES.clear()
+        _PURPOSES.update(pins)
+    if groups:
+        _log("groups: " + ", ".join(f"{g}={len(p)}pat" for g, p in sorted(groups.items())))
+    if pins:
+        _log(f"purpose pins: {len(pins)} ({', '.join(sorted(pins))})")
+    if ENRICH_ENABLED:
+        _log(f"enrichment: on model={ENRICH_MODEL} base={ENRICH_BASE_URL} "
+             f"conc={ENRICH_CONCURRENCY} timeout={ENRICH_TIMEOUT}s -> {PURPOSES_PATH}")
+    else:
+        _log("enrichment: off (set ENRICH_BASE_URL + ENRICH_MODEL to enable)")
+
+
 # ---------------------------------------------------------------- FastMCP
 
 @asynccontextmanager
 async def _lifespan(app):
     try:
+        _init_config()
+        _load_purposes()
         if not _load_manifest():
             _log("no manifest, initial upstream fetch...")
             refresh_catalog(force=True)
@@ -1113,6 +1650,9 @@ async def _lifespan(app):
             except Exception as e:
                 _log(f"initial fetch failed, staying on disk manifest: {e}")
                 _update_instructions()
+                # upstream down but the catalog is served from disk: refresh the
+                # note cache anyway, so a cold purposes.json still populates.
+                _enrich_async()
     except Exception as e:
         _log(f"lifespan: catalog unavailable at startup: {e}")
     yield
@@ -1124,14 +1664,16 @@ mcp = FastMCP(
         "Search-first proxy in front of MCP upstreams. "
         "Flow: mcp_search to find names, mcp_describe for full schemas, "
         "mcp_call to execute. mcp_refresh only when a tool comes back unknown or stale — never refresh before every call. "
-        "Never tell the user a capability is unavailable without searching first."
+        "Never tell the user a capability is unavailable without searching first. "
+        "When the tool name and its required params are already obvious from this catalog, "
+        "call mcp_call directly: mcp_describe is only needed for the full schema."
     ),
     lifespan=_lifespan,
 )
 
 
-@mcp.tool(description="Search MCP tools by topic (BM25 over names+descriptions+params). Returns names + mini-cards, never full schemas. If top results share one prefix (e.g. all thread_*) and the query has multiple intents, retry with a higher limit (e.g. 10).")
-def mcp_search(query: str, limit: int = SEARCH_DEFAULT_LIMIT) -> dict:
+@mcp.tool(description="Search MCP tools by topic (BM25 over names+descriptions+params). Returns names + mini-cards, never full schemas. If top results share one prefix (e.g. all thread_*) and the query has multiple intents, retry with a higher limit (e.g. 10). Optional `group` restricts results to one catalog group (see instructions).")
+def mcp_search(query: str, limit: int = SEARCH_DEFAULT_LIMIT, group: str | None = None) -> dict:
     _ensure_catalog()
     if isinstance(query, list):  # tolerance: list -> first entry
         query = query[0] if query else ""
@@ -1145,7 +1687,20 @@ def mcp_search(query: str, limit: int = SEARCH_DEFAULT_LIMIT) -> dict:
     limit = max(1, min(limit, SEARCH_MAX_LIMIT))
     if len(query.split()) > 20:
         query = " ".join(query.split()[:20])
-    names = _search_one(query, limit)
+    group = (group or "").strip().lower() or None
+    if group is not None:
+        with _LOCK:
+            known = sorted(_GROUPS)
+        if group not in known:
+            # fail-closed: an unknown group must not silently widen to the whole catalog
+            return {"ok": False, "error": f"unknown group '{group}'",
+                    "groups": known or "no groups configured",
+                    "hint": "omit `group` to search the whole catalog"}
+        # over-fetch, then restrict: the group filter must not shrink the result
+        # set below `limit` just because the top BM25 hits live elsewhere.
+        names = [n for n in _search_one(query, SEARCH_MAX_LIMIT) if _in_group(n, group)][:limit]
+    else:
+        names = _search_one(query, limit)
     with _LOCK:
         total = _N
     tools: dict[str, dict] = {}
@@ -1159,19 +1714,26 @@ def mcp_search(query: str, limit: int = SEARCH_DEFAULT_LIMIT) -> dict:
             }
     out: dict = {"ok": True, "query": query, "total_available": total,
                  "results": [{"query": query, "matches": names}], "tools": tools}
+    if group is not None:
+        out["group"] = group
+        out["group_size"] = len(_group_names(group))
     if not names:
         with _LOCK:
             from collections import Counter
             c = Counter(_source_of(n) for n in _BY_NAME)
             out["available_sources"] = [{"name": k, "tool_count": v}
                                         for k, v in sorted(c.items())]
-            out["hint"] = ("no lexical match: try synonyms or English terms "
-                           "(e.g. 'email' instead of 'posta'), or mcp_refresh if the catalog is stale")
+            if group is not None:
+                out["group_members"] = _group_names(group)[:SEARCH_MAX_LIMIT]
+            out["hint"] = (("no match inside group '%s': retry without `group` or use a listed member" % group)
+                           if group else
+                           ("no lexical match: try synonyms or English terms "
+                            "(e.g. 'email' instead of 'posta'), or mcp_refresh if the catalog is stale"))
     return out
 
 
-@mcp.tool(description="Full input schemas only for the listed names (max 10/call). If you see the exact name in the listing, skip mcp_search and come straight here.")
-def mcp_describe(names: list[str]) -> dict:
+@mcp.tool(description="Full input schemas only for the listed names (max 10/call). If you see the exact name in the listing, skip mcp_search and come straight here. Optional `group` rejects names outside that catalog group.")
+def mcp_describe(names: list[str], group: str | None = None) -> dict:
     _ensure_catalog()
     if isinstance(names, str):
         names = [names]
@@ -1180,6 +1742,20 @@ def mcp_describe(names: list[str]) -> dict:
         return {"ok": False, "error": "empty names"}
     if len(names) > DESCRIBE_MAX_NAMES:
         return {"ok": False, "error": f"max {DESCRIBE_MAX_NAMES} names per call", "received": len(names)}
+    group = (group or "").strip().lower() or None
+    if group is not None:
+        with _LOCK:
+            known = sorted(_GROUPS)
+        if group not in known:
+            return {"ok": False, "error": f"unknown group '{group}'",
+                    "groups": known or "no groups configured",
+                    "hint": "omit `group` to describe any tool"}
+        # fail-closed: a name outside the group is reported, not described
+        outside = [n for n in names if not _in_group(n, group)]
+        if outside:
+            return {"ok": False, "error": "names outside group",
+                    "group": group, "outside": outside[:DESCRIBE_MAX_NAMES],
+                    "hint": "call mcp_describe without `group` for these names"}
     seen, uniq = set(), []
     for n in names:
         if n not in seen:
@@ -1196,6 +1772,8 @@ def mcp_describe(names: list[str]) -> dict:
                 tools[n] = {"description": t.get("description", ""),
                             "parameters": t.get("inputSchema", {"type": "object"})}
     out: dict = {"ok": True, "tools": tools, "not_found": not_found, "errors": {}}
+    if group is not None:
+        out["group"] = group
     if not_found:
         out["hint"] = "use mcp_search for the correct names, or mcp_refresh if the catalog is stale"
     return out
@@ -1256,15 +1834,28 @@ def mcp_call(name: str, arguments: dict | str | None = None) -> dict:
     return {"ok": True, "tool": name, "result": result}
 
 
-@mcp.tool(description="Re-list all upstreams + rebuild the BM25 index. Use ONLY when a tool comes back unknown/stale — never before every search/call. Returns count/chars/fingerprint.")
+def _enrich_status() -> dict:
+    """Cache/enrichment state for mcp_refresh, in BOTH the success and the
+    failure branch: when an upstream is down, inspecting the note cache is
+    exactly what an operator needs."""
+    with _LOCK:
+        groups = {g: len(_group_names(g)) for g in sorted(_GROUPS)}
+        return {"enabled": ENRICH_ENABLED, "model": ENRICH_MODEL or None,
+                "running": _ENRICH_RUNNING, "state": dict(_ENRICH_STATE),
+                "notes_cached": len(_ENRICHED), "pins": len(_PURPOSES),
+                "enabled_groups": groups}
+
+
+@mcp.tool(description="Re-list all upstreams + rebuild the BM25 index. Use ONLY when a tool comes back unknown/stale — never before every search/call. Returns count/chars/fingerprint, plus the state of the semantic-note cache.")
 def mcp_refresh() -> dict:
     try:
         stats = refresh_catalog(force=True)
-        return stats
     except Exception as e:
         with _LOCK:
-            fallback = {"ok": False, "error": str(e), "cached_count": _N, "cached_fingerprint": _FINGERPRINT}
-        return fallback
+            return {"ok": False, "error": str(e), "cached_count": _N,
+                    "cached_fingerprint": _FINGERPRINT, "enrich": _enrich_status()}
+    stats["enrich"] = _enrich_status()
+    return stats
 
 
 if __name__ == "__main__":

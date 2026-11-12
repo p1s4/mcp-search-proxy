@@ -1,7 +1,7 @@
 services:
   mcp-search-proxy:
     build: .
-    image: mcp-search-proxy:1.0.7
+    image: mcp-search-proxy:1.1.1
     container_name: mcp-search-proxy
     restart: unless-stopped
     mem_limit: 512m
@@ -28,6 +28,33 @@ services:
       # 1800 = safety-net TTL, 0 = explicit mcp_refresh / unknown-tool only.
       - CATALOG_TTL_SEC=1800
       - LOG_LEVEL=INFO
+      # --- 1.1.0: groups + semantic notes ------------------------------------
+      # GROUPS: logical groups for the optional `group` param of
+      # mcp_search/mcp_describe. Syntax: name=pattern[,pattern];name2=...
+      # The pattern is fnmatch-ed against the tool name AND the source prefix,
+      # so membership follows the upstreams by itself. Fail-closed: an unknown
+      # group never widens to the whole catalog.
+      # - GROUPS=workspace=Google_Workspace*,file_bridge;audit=browser*,scan*
+      # PURPOSES: manual purpose pins (win over everything). Use ONLY for the
+      # exceptions that must not drift; the other notes are model-generated.
+      # Since 1.1.1 a pin replaces the purpose ONLY: obligations always come
+      # from the deterministic layer, so a pin cannot erase a MUST/NEVER.
+      # - PURPOSES=my_source=What it does and when to use it.
+      # Optional semantic notes: any OpenAI-compatible endpoint.
+      # ENRICH_BASE_URL must include the API version. If ENRICH_BASE_URL or
+      # ENRICH_MODEL are empty the feature is OFF (1.0.x behaviour).
+      # ENRICH_API_KEY empty -> falls back to LITELLM_MASTER_KEY.
+      # - ENRICH_BASE_URL=http://litellm:4000/v1
+      # - ENRICH_MODEL=gemini-lite
+      # - ENRICH_API_KEY=
+      # - ENRICH_TIMEOUT=60
+      # - ENRICH_CONCURRENCY=4
+      # --- 1.1.1: obligations layer (no env: always on) ----------------------
+      # The upstream's imperative rules (MUST, NEVER, 'start with X first',
+      # 'before building ... confirm') are extracted VERBATIM and
+      # deterministically and published in a separate section of the
+      # instructions. No LLM, no paraphrase: PURPOSE and OBLIGATIONS are two
+      # additive layers.
     volumes:
       - ./data:/app/data
 
